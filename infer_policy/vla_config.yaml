@@ -1,0 +1,348 @@
+# ============================================================================
+# PI05 VLA 推理配置（仅 VLA，无导航/放置）
+# ============================================================================
+
+# ---- gRPC PolicyServer ----
+# 公网 30017 未做 DNAT，经 SSH 隧道：ssh -p 50017 -L 127.0.0.1:30017:127.0.0.1:30017 zhangyuqi@112.65.216.193
+policy_server_address: "127.0.0.1:30017"
+auto_setup_policy: true  # 启动时自动探测远端模型：已加载则跳过，未加载则触发 setup_policy
+
+# ---- 模型 ----
+# 必须与 observation/action schema 来自同一套 checkpoint。
+# behavior tree 的 040000 模型使用 4 路相机、23 维状态和 23 维动作。
+policy_type: "pi05"
+pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/pick/checkpoints/040000/pretrained_model"
+force_setup_policy: true  # 强制按上面路径加载，避免远端已有旧模型时跳过 setup
+device: "cuda"  # 推理设备：cuda / cpu
+
+# ---- 推理加速（远端 GPU 优化）----
+inference_optimization:
+  # 模型精度: float32 / float16 / bfloat16 / auto
+  # float16 可将显存占用量减半，通常带来 1.5~2x 推理加速（需要 GPU 支持）
+  # bfloat16 动态范围与 float32 相同，精度损失更小
+  # auto = 使用模型原始精度
+  torch_dtype: "bfloat16"
+  # torch.compile 动态图编译 (PyTorch 2.0+)
+  # 首次推理慢（编译耗时），后续调用加速 10~30%
+  torch_compile: true
+  # CUDA Graph 捕获固定计算图
+  # 最大程度减少 kernel launch 开销，要求输入 shape 固定
+  use_cuda_graph: false
+
+# ---- 推理参数 ----
+actions_per_chunk: 50         # 每次推理返回的动作帧数
+execute_actions_per_chunk: 10 # 执行前 N 帧后立即重新推理（RTC 模式下自动忽略此参数）
+fps: 30
+
+
+obs_queue_timeout: 1.0
+action_response_timeout: 30.0  # 单次 GetActions RPC 截止时间；空响应立即视为服务端推理失败
+
+# 四路工作模式原图按 profile 的 checkpoint 输入尺寸 letterbox，再无损 PNG 传输。
+# PolicyServer 还原 uint8 后由 prepare_image 做 /255，再由 PI05 做
+# resize_with_pad(224) 和 [-1, 1]；
+# 对已是 224 的图 resize_with_pad 基本恒等。
+observation_transport:
+  image_encoding: "png"
+  png_compress_level: 3  # 无损传输训练使用的四路图像
+
+# ---- 任务指令（须与训练数据中的原始文本完全一致） ----
+instruction: "Left arm pick up A. Right arm pick up A."
+
+# ---- PI05 pick 模型观测特征（与 train_config.json input_features 一致）----
+# 禁止 observation_mapping 把 23 个平键收成 observation.state 数组。
+# PolicyServer.build_dataset_frame() 按 names 从原始 obs 读 right_arm_joint1 等平键。
+observation_mapping: {}
+
+observation_features:
+  observation.images.head_left:
+    dtype: "image"
+    shape: [480, 640, 3]
+    names: ["height", "width", "channels"]
+  observation.images.head_right:
+    dtype: "image"
+    shape: [480, 640, 3]
+    names: ["height", "width", "channels"]
+  observation.images.left_arm:
+    dtype: "image"
+    shape: [480, 640, 3]
+    names: ["height", "width", "channels"]
+  observation.images.right_arm:
+    dtype: "image"
+    shape: [480, 640, 3]
+    names: ["height", "width", "channels"]
+  observation.state:
+    dtype: "float32"
+    shape: [23]
+    names:
+      - right_arm_joint1
+      - right_arm_joint2
+      - right_arm_joint3
+      - right_arm_joint4
+      - right_arm_joint5
+      - right_arm_joint6
+      - right_arm_joint7
+      - right_arm_gripper
+      - left_arm_joint1
+      - left_arm_joint2
+      - left_arm_joint3
+      - left_arm_joint4
+      - left_arm_joint5
+      - left_arm_joint6
+      - left_arm_joint7
+      - left_arm_gripper
+      - leg_joint1
+      - leg_joint2
+      - leg_joint3
+      - leg_joint4
+      - leg_joint5
+      - head_joint1
+      - head_joint2
+
+# ---- 机器人硬件 ----
+robot:
+  # 传感器
+  sensor_set:
+    - HEAD_LEFT_CAMERA
+    - HEAD_RIGHT_CAMERA
+    - LEFT_ARM_CAMERA
+    - RIGHT_ARM_CAMERA
+  sensor_warmup_seconds: 15.0
+  camera_rgb_retries: 8
+  camera_rgb_retry_delay: 0.3
+
+  # 观测输出 key → SDK 摄像头名映射
+  # 输出 key 必须匹配远端 PolicyServer 期望的平键格式（非 observation.images.xxx）
+  observation_camera_map:
+    head_left: "head_left"
+    head_right: "head_right"
+    left_arm: "left_arm"
+    right_arm: "right_arm"
+
+  # 头相机 ROI 已禁用。原图直接 letterbox，不再裁 4:3、不再经过 640×480。
+  head_camera_roi:
+    enabled: false
+    expected_size: [960, 1280]           # [H, W]
+    head_left: [118, 784, 243, 1123]     # img[118:784, 243:1123]
+
+  # 坐标系
+  reference_frame: "base_link"
+  end_effector_frame: "right_arm"
+
+  # SDK 状态特征名（23 维）；完整顺序与模型 action_feature_names 一致。
+  # 顺序: right_arm(7) + right_gripper(1) + left_arm(7) + left_gripper(1) + leg(5) + head(2)
+  state_feature_names:
+    - right_arm_joint1
+    - right_arm_joint2
+    - right_arm_joint3
+    - right_arm_joint4
+    - right_arm_joint5
+    - right_arm_joint6
+    - right_arm_joint7
+    - right_arm_gripper
+    - left_arm_joint1
+    - left_arm_joint2
+    - left_arm_joint3
+    - left_arm_joint4
+    - left_arm_joint5
+    - left_arm_joint6
+    - left_arm_joint7
+    - left_arm_gripper
+    - leg_joint1
+    - leg_joint2
+    - leg_joint3
+    - leg_joint4
+    - leg_joint5
+    - head_joint1
+    - head_joint2
+
+  # 新模型输出完整 23 维；leg/head joint_groups 仍 disabled，不会下发这 7 维。
+  vla_action_dim: 23
+
+  # 关节组定义 — indices 为模型 23 维中的索引，与 get_joint_state 返回顺序一致
+  # enabled: 是否下发控制，is_gripper: 是否需要夹爪位置缩放
+  # 顺序: right_arm(7) → right_gripper(1) → left_arm(7) → left_gripper(1) → leg(5) → head(2)
+  joint_groups:
+    - name: right_arm
+      indices: [0, 1, 2, 3, 4, 5, 6]
+      enabled: true
+    - name: right_gripper
+      indices: [7]
+      is_gripper: true
+      enabled: true
+    - name: left_arm
+      indices: [8, 9, 10, 11, 12, 13, 14]
+      enabled: true
+    - name: left_gripper
+      indices: [15]
+      is_gripper: true
+      enabled: true
+    - name: leg
+      indices: [16, 17, 18, 19, 20]
+      enabled: false
+    - name: head
+      indices: [21, 22]
+      enabled: false
+
+  # # 夹爪
+  # gripper_group: "right_gripper"
+  # gripper_velocity: 0.15
+  # gripper_effort: 10.0
+  # gripper_min_width: 0.0
+  # gripper_max_width: 0.12
+  # gripper_width_command_scale: 1.0
+
+  # 初始姿态 — 按关节组名 key，值是各关节目标位置列表
+  # 组名需与 joint_groups.name 一致；夹爪值 0~0.12（物理宽度），会被 _gripper_command_position 转换
+  init_joint_positions:
+    # 行为树开始 pick 前使用的准备姿态；与 pick/init_position 脚本保持一致。
+    right_arm: [-1.074697, 0.587419, 0.683460, 1.414618, 0.352612, -0.195067, -1.538162]
+    right_gripper: [0.0]
+    left_arm: [0.767878, -0.583967, -0.088312, -1.620591, -0.284889, 0.026508, 1.193521]
+    left_gripper: [0.0]
+    leg: [0.576609, 1.462627, 0.925278, 0.040399, 0.000090]
+    head: [-0.074925, 0.430006]
+
+  # /restore_initial_pose succeeds only after fresh SDK feedback confirms that
+  # the robot actually reached this configured preparation pose.
+  init_pose_verify:
+    joint_tolerance_rad: 0.03
+    gripper_tolerance_model: 3.0
+
+  # 右方向键恢复：使用与之前可用版本相同的 set_joint_commands 控制路径。
+  # 不在 server 持有 SDK 时切换到 set_joint_positions/set_gripper_command。
+  recovery:
+    gripper_open_width: 0.12   # 夹爪完全张开宽度，米
+    settle_seconds: 8.0        # 下发成功后等待运动到位
+    retries: 2
+
+  # 控制参数
+  control:
+    # checkpoint 的 postprocessor 已把相对动作加回 observation.state。
+    # 客户端收到的是绝对关节目标，禁止在机器人侧再次累加当前位置。
+    action_semantics: "absolute"
+    fps: 30
+    dt: 0.033
+    set_joint_time_from_start: 0.0
+    gripper_action_scale: 0.0012
+    # 数据集中双臂 action 的 99% 相邻帧变化不超过 0.024 rad；0.08 rad
+    # 留出跟踪余量，同时拒绝模型失稳时的大幅跳变。
+    max_joint_delta_per_step: 0.08
+    gripper_max_delta_per_step: 20.0
+    # 保守的真机软件限位（23 维，顺序与 state_feature_names 一致）。
+    # 新 checkpoint 超出这里的极端输出仍会被裁剪，不能仅按训练统计擅自放宽真机限位。
+    # 夹爪保持训练数据的完整 [0, 100]。
+    # 双肘下放极限来自手动示教位姿，未再内缩，避免起步就被往回拉。
+    # 右臂 joint4 下放时角度变小 → 改下限；左臂镜像，下放时角度变大 → 改上限。
+    # 另一侧仍用原数据集限位。
+    # right_arm(7) + right_gripper(1) + left_arm(7) + left_gripper(1) + leg(5) + head(2)
+    joint_limits:
+      - [-1.83, 0.11]       # right_arm_joint1
+      - [0.29, 1.6081]      # right_arm_joint2
+      - [-0.84, 1.17]       # right_arm_joint3
+      - [1.178, 2.47]       # right_arm_joint4  下限=手动下放极限
+      - [-0.76, 1.04]       # right_arm_joint5
+      - [-0.7354, 0.8227]   # right_arm_joint6
+      - [-1.5382, 0.61]     # right_arm_joint7
+      - [0, 100]             # right_arm_gripper
+      - [0.0, 1.45]         # left_arm_joint1
+      - [-1.6081, -0.27]    # left_arm_joint2
+      - [-0.77, 0.74]       # left_arm_joint3
+      - [-2.38, -1.248]     # left_arm_joint4  上限=手动下放极限
+      - [-1.16, 0.81]       # left_arm_joint5
+      - [-0.64, 0.7354]     # left_arm_joint6
+      - [-1.26, 1.5382]     # left_arm_joint7
+      - [0, 100]             # left_arm_gripper
+      - [0.0, 0.9374]       # leg_joint1
+      - [0.0, 2.5847]       # leg_joint2
+      - [0.0, 2.3262]       # leg_joint3
+      - [-1.5906, 1.5906]   # leg_joint4
+      - [-0.1645, 0.1645]   # leg_joint5
+      - [-1.5208, 1.5208]   # head_joint1
+      - [-0.2143, 0.4936]   # head_joint2
+
+    # 动作滤波（防抖动） — 在关节限幅后、下发前平滑指令
+    action_filter:
+      enabled: false                # 是否启用滤波
+      type: "lowpass"              # 滤波方式: none / lowpass / moving_average / one_euro
+      # 一阶低通 (EMA): y = α·x + (1-α)·y_prev, α 越小越平滑
+      lowpass:
+        alpha: 0.3                 # 0~1
+      # 滑动均值: 取最近 window_size 步的平均值
+      moving_average:
+        window_size: 5             # 窗口大小
+      # 1€ 自适应滤波: 静止时强去抖, 快速移动时低延迟
+      one_euro:
+        freq: 30.0                 # 采样率 Hz, 与 fps 保持一致
+        min_cutoff: 1.0            # 最小截止频率 Hz, 越小越平滑
+        beta: 0.01                 # 速度增益, 控制响应灵敏度
+        d_cutoff: 1.0              # 速度估计截止频率 Hz
+
+    # 关节插值 — 将模型输出 (30Hz) 升频到 SDK 控制 (250Hz)，运动更平滑
+    interpolation:
+      enabled: true                # 是否启用插值
+      # 每次 VLA 重规划都会给出新的短轨迹；三次样条在 chunk 边界可能产生
+      # 过冲/反向速度，表现为机械臂抖动。线性插值严格位于相邻目标之间。
+      method: "linear"
+      input_hz: 30                 # 模型推理频率
+      output_hz: 250               # SDK 高频下发，不丢弃 30 Hz 的模型动作帧
+  
+# ----工程实现 RTC 异步推理（Real-Time Chunking 与pi05模型官方不一致）不和关节插值等同时生效----
+rtc:
+  enabled: false                       # 是否启用异步推理；改完后必须重启 infer_server
+  # 实测 async infer P50≈356ms、P95≈586ms。40 只提前约 10 帧（330ms），余量不足。
+  # 32 → 提前 18 帧（600ms），覆盖 P95。
+  pre_infer_threshold: 32
+  fusion_window: 10
+  fusion_method: "weighted"
+  warmup_inferences: 1                # 丢弃 compile 首包，禁止把 2.9s 首包投入执行
+
+# ---- HTTP Server ----
+server:
+  host: "0.0.0.0"
+  port: 8005
+  vla_inference_log_file: "vla_inference_results.jsonl"
+  save_observation_images: false
+
+# ---- 推理日志（结构化日志 + 可选图像保存）----
+inference_log:
+  enabled: true                        # 是否启用日志
+  log_dir: "logs"                      # 日志根目录
+  max_log_size_mb: 100                 # 单个日志文件最大大小 (MB)，超过后自动滚动
+  log_data: true                      # true=记录 state/actions 完整数据；false=只记录延迟
+  # 图像保存
+  save_images: true                   # 是否保存观测图像
+  image_dir: "logs/images"             # 图像子目录
+  max_image_runs: 5                    # 只保留最近 N 次推理的图像（超出自动删除）
+
+# ---- 一次性相机诊断（POST /camera_snapshot）----
+camera_diagnostics:
+  snapshot_dir: "logs/camera_snapshots"
+
+# ---- 图像预处理 ----
+# 默认与 pick checkpoint 的输入 schema 对齐为 480×640；place profile 覆盖为 224×224。
+image_preprocess:
+  enabled: true
+  target_size: [480, 640]
+  keep_aspect_ratio: true
+  crop_to_training_aspect: false
+  training_hw: [480, 640]
+  enforce_training_geometry: false
+  black_bar_tolerance_px: 4
+  emulate_data_collection:
+    enabled: false
+    scheme: via_640
+    output_wh: [640, 480]
+    cameras:
+      head_left:
+        undistort_type: 1
+        zoom_factor: 1.0
+      head_right:
+        undistort_type: 1
+        zoom_factor: 1.0
+      left_arm:
+        zoom_factor: 1.0
+        crop_to_training_aspect: false
+      right_arm:
+        zoom_factor: 1.0
+        crop_to_training_aspect: false

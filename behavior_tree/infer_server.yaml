@@ -1,0 +1,47 @@
+# One G1 SDK owner. Both profiles use 4 cameras, 23-D state and 23-D action.
+reference_infer_policy_dir: "../infer_policy"
+base_vla_config: "../infer_policy/vla_config.yaml"
+
+server:
+  host: "0.0.0.0"
+  port: 8006
+
+# Do not restart capture. Switching para_dir unmatches XCU WBC.
+# Working-mode frames are letterboxed to each profile's checkpoint input size.
+head_camera:
+  startup_mode: "skip"
+
+vla_profiles:
+  model_at_a:
+    # Pick checkpoint was trained with four 480x640 camera inputs.
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/pick/checkpoints/040000/pretrained_model"
+    policy_server_address: "127.0.0.1:30017"
+    force_setup_policy: true
+    image_preprocess:
+      target_size: [480, 640]
+
+  model_at_b:
+    # Place checkpoint was trained with four 224x224 camera inputs.
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/place/checkpoints/040000/pretrained_model"
+    # A second PolicyServer process, also running on CUDA device 7.
+    policy_server_address: "127.0.0.1:30018"
+    force_setup_policy: true
+    observation_features:
+      observation.images.head_left:
+        dtype: "image"
+        shape: [224, 224, 3]
+        names: ["height", "width", "channels"]
+      observation.images.head_right:
+        dtype: "image"
+        shape: [224, 224, 3]
+        names: ["height", "width", "channels"]
+      observation.images.left_arm:
+        dtype: "image"
+        shape: [224, 224, 3]
+        names: ["height", "width", "channels"]
+      observation.images.right_arm:
+        dtype: "image"
+        shape: [224, 224, 3]
+        names: ["height", "width", "channels"]
+    image_preprocess:
+      target_size: [224, 224]
