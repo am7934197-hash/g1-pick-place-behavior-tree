@@ -360,10 +360,12 @@ def summarize_postprocessed_action_delta(obs: dict, actions: list) -> dict:
     for item in actions:
         value = item.get("action") if isinstance(item, dict) else None
         arr = np.asarray(value, dtype=np.float32).reshape(-1) if value is not None else np.array([])
-        if arr.size != 16 or not np.all(np.isfinite(arr)):
+        if arr.size not in (16, 23) or not np.all(np.isfinite(arr)):
             invalid_actions += 1
             continue
-        vectors.append(arr)
+        # Diagnostics concern only the commanded arms/grippers.  A legacy
+        # 23-D place action additionally contains disabled leg/head targets.
+        vectors.append(arr[:16])
     if not vectors:
         return {
             "action_semantics": "absolute_postprocessed",

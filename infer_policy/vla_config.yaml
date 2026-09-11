@@ -9,9 +9,10 @@ auto_setup_policy: true  # 启动时自动探测远端模型：已加载则跳�
 
 # ---- 模型 ----
 # 必须与 observation/action schema 来自同一套 checkpoint。
-# behavior tree 的 040000 模型使用 4 路相机、23 维状态和 23 维动作。
+# 默认的新 pick 模型使用 3 路相机、23 维状态和 16 维动作。
+# behavior_tree/infer_server.yaml 会为旧 place profile 补回第 4 路相机。
 policy_type: "pi05"
-pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/pick/checkpoints/040000/pretrained_model"
+pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/models/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
 force_setup_policy: true  # 强制按上面路径加载，避免远端已有旧模型时跳过 setup
 device: "cuda"  # 推理设备：cuda / cpu
 
@@ -38,38 +39,34 @@ fps: 30
 obs_queue_timeout: 1.0
 action_response_timeout: 30.0  # 单次 GetActions RPC 截止时间；空响应立即视为服务端推理失败
 
-# 四路工作模式原图按 profile 的 checkpoint 输入尺寸 letterbox，再无损 PNG 传输。
+# 共享相机原图按当前 profile 的 checkpoint 输入尺寸 letterbox，再无损 PNG 传输。
 # PolicyServer 还原 uint8 后由 prepare_image 做 /255，再由 PI05 做
 # resize_with_pad(224) 和 [-1, 1]；
 # 对已是 224 的图 resize_with_pad 基本恒等。
 observation_transport:
   image_encoding: "png"
-  png_compress_level: 3  # 无损传输训练使用的四路图像
+  png_compress_level: 3  # 无损传输当前 profile 使用的图像
 
 # ---- 任务指令（须与训练数据中的原始文本完全一致） ----
 instruction: "Left arm pick up A. Right arm pick up A."
 
-# ---- PI05 pick 模型观测特征（与 train_config.json input_features 一致）----
+# ---- PI05 pick 模型观测特征（与新 checkpoint config.json 完全一致）----
 # 禁止 observation_mapping 把 23 个平键收成 observation.state 数组。
 # PolicyServer.build_dataset_frame() 按 names 从原始 obs 读 right_arm_joint1 等平键。
 observation_mapping: {}
 
 observation_features:
-  observation.images.head_left:
-    dtype: "image"
-    shape: [480, 640, 3]
-    names: ["height", "width", "channels"]
   observation.images.head_right:
     dtype: "image"
-    shape: [480, 640, 3]
+    shape: [224, 224, 3]
     names: ["height", "width", "channels"]
   observation.images.left_arm:
     dtype: "image"
-    shape: [480, 640, 3]
+    shape: [224, 224, 3]
     names: ["height", "width", "channels"]
   observation.images.right_arm:
     dtype: "image"
-    shape: [480, 640, 3]
+    shape: [224, 224, 3]
     names: ["height", "width", "channels"]
   observation.state:
     dtype: "float32"
@@ -101,7 +98,8 @@ observation_features:
 
 # ---- 机器人硬件 ----
 robot:
-  # 传感器
+  # 共享硬件传感器。head_left 虽不送入新 pick 模型，但旧 place 模型仍需要，
+  # 因此行为树进程启动时继续采集四路相机。
   sensor_set:
     - HEAD_LEFT_CAMERA
     - HEAD_RIGHT_CAMERA
@@ -156,8 +154,9 @@ robot:
     - head_joint1
     - head_joint2
 
-  # 新模型输出完整 23 维；leg/head joint_groups 仍 disabled，不会下发这 7 维。
-  vla_action_dim: 23
+  # 新 pick 模型输出双臂和双夹爪共 16 维。旧 place 模型的完整 23 维也被
+  # RobotController 接受；leg/head joint_groups 仍 disabled，不会下发。
+  vla_action_dim: 16
 
   # 关节组定义 — indices 为模型 23 维中的索引，与 get_joint_state 返回顺序一致
   # enabled: 是否下发控制，is_gripper: 是否需要夹爪位置缩放
@@ -195,10 +194,10 @@ robot:
   # 初始姿态 — 按关节组名 key，值是各关节目标位置列表
   # 组名需与 joint_groups.name 一致；夹爪值 0~0.12（物理宽度），会被 _gripper_command_position 转换
   init_joint_positions:
-    # 行为树开始 pick 前使用的准备姿态；与 pick/init_position 脚本保持一致。
-    right_arm: [-1.074697, 0.587419, 0.683460, 1.414618, 0.352612, -0.195067, -1.538162]
+    # 新数据 task 0（A+A）的 episode 首帧中位数。
+    right_arm: [-1.085722, 0.586364, 0.691154, 1.415937, 0.352408, -0.202317, -1.538150]
     right_gripper: [0.0]
-    left_arm: [0.767878, -0.583967, -0.088312, -1.620591, -0.284889, 0.026508, 1.193521]
+    left_arm: [0.790863, -0.594513, -0.110183, -1.619236, -0.285080, 0.030295, 1.149216]
     left_gripper: [0.0]
     leg: [0.576609, 1.462627, 0.925278, 0.040399, 0.000090]
     head: [-0.074925, 0.430006]
@@ -320,12 +319,13 @@ camera_diagnostics:
   snapshot_dir: "logs/camera_snapshots"
 
 # ---- 图像预处理 ----
-# 默认与 pick checkpoint 的输入 schema 对齐为 480×640；place profile 覆盖为 224×224。
+# 新 pick 和旧 place checkpoint 的网络输入均为 224×224。
 image_preprocess:
   enabled: true
-  target_size: [480, 640]
+  target_size: [224, 224]
   keep_aspect_ratio: true
   crop_to_training_aspect: false
+  # clean_ready_224 是从 640×480 原视频等比缩放并上下补黑边生成。
   training_hw: [480, 640]
   enforce_training_geometry: false
   black_bar_tolerance_px: 4

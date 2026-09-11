@@ -1114,9 +1114,9 @@ class RobotController:
     def _expand_model_action(self, action: Sequence[float], current_state: np.ndarray) -> np.ndarray:
         """Expand the configured model action prefix to the full 23-D robot state.
 
-        The behavior-tree 040000 policies predict all 23 dimensions. Shorter
-        action prefixes remain accepted for compatibility; missing dimensions
-        are copied from the latest measured state.
+        The new pick policy predicts a 16-D arms/grippers prefix, while the
+        legacy place policy predicts all 23 dimensions. Missing dimensions are
+        copied from the latest measured state.
         """
         full_dim = 23
         model_dim = int(self.cfg.get("vla_action_dim", full_dim))
@@ -1146,8 +1146,8 @@ class RobotController:
         """Execute configured model actions via 23-D set_joint_commands.
 
         Full order: right_arm(7) + right_gripper(1) + left_arm(7) +
-        left_gripper(1) + leg(5) + head(2). The configured 23-D policy output
-        is safety-checked in full, while disabled joint groups are not sent.
+        left_gripper(1) + leg(5) + head(2). Every policy output is expanded and
+        safety-checked in 23-D, while disabled joint groups are not sent.
         Grippers at model index 7 (right) and 15 (left) receive special position scaling.
 
         Config ``robot.joint_groups`` defines which groups + their model indices.

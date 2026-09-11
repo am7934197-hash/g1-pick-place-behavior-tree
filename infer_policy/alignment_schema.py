@@ -1,11 +1,11 @@
-"""Schema shared by the 040000 pick/place policies used by the behavior tree."""
+"""Schemas shared by the mixed-generation pick/place behavior-tree policies."""
 
 from __future__ import annotations
 
 from typing import List
 
 PICK_CHECKPOINT = (
-    "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/pick/"
+    "/home/zhangyuqi/zhangyuqi/models/g1/pick_place_0911_clean179/"
     "checkpoints/040000/pretrained_model"
 )
 PLACE_CHECKPOINT = (
@@ -27,8 +27,8 @@ REQUIRED_CHECKPOINT_FILES = (
 )
 
 READY224_DIR = (
-    "/home/zhangyuqi/zhangyuqi/G1-20260821/G1_data/pickandplace/"
-    "pick_place_top1_actiondim_import/ready_224"
+    "/home/zhangyuqi/zhangyuqi/G1-20260911/G1_data/pick_place_9.11/test/"
+    "clean_ready_224"
 )
 
 STATE_NAMES: List[str] = [
@@ -57,21 +57,24 @@ STATE_NAMES: List[str] = [
     "head_joint2",
 ]
 
-ACTION_NAMES: List[str] = list(STATE_NAMES)
+# The new pick policy predicts the two arms and two grippers.  The legacy place
+# policy still returns the full 23-D vector; RobotController accepts both and
+# fills the missing leg/head targets from fresh measured state for the pick model.
+ACTION_NAMES: List[str] = list(STATE_NAMES[:16])
 ARM_JOINT_INDICES = tuple(i for i in range(16) if i not in (7, 15))
 GRIPPER_INDICES = (7, 15)
-CAMERA_KEYS = ("head_left", "head_right", "left_arm", "right_arm")
+CAMERA_KEYS = ("head_right", "left_arm", "right_arm")
 TRAINING_FPS = 30.0
-TRAINING_IMAGE_HW = (480, 640)
-MODEL_IMAGE_HW = (480, 640)
+TRAINING_IMAGE_HW = (224, 224)
+MODEL_IMAGE_HW = (224, 224)
 TRAINING_LETTERBOX_CONTENT_HW = (168, 224)
 TRAINING_LETTERBOX_PAD_TBLR = (28, 28, 0, 0)
 
-# Episode-0 medians claimed for ready_224 pickup episodes.
+# Start-state medians for task 0 in clean_ready_224.
 INIT_JOINT_POSITIONS = {
-    "right_arm": [-1.074697, 0.587419, 0.683460, 1.414618, 0.352612, -0.195067, -1.538162],
+    "right_arm": [-1.085722, 0.586364, 0.691154, 1.415937, 0.352408, -0.202317, -1.538150],
     "right_gripper": [0.0],
-    "left_arm": [0.767878, -0.583967, -0.088312, -1.620591, -0.284889, 0.026508, 1.193521],
+    "left_arm": [0.790863, -0.594513, -0.110183, -1.619236, -0.285080, 0.030295, 1.149216],
     "left_gripper": [0.00],
     "leg": [0.576609, 1.462627, 0.925278, 0.040399, 0.000090],
     "head": [-0.074925, 0.430006],

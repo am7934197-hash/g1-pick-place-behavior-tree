@@ -2,7 +2,7 @@
 
 执行顺序：`infer_server 保持工作模式头相机 → pick 点模型 → 地图导航到 place → place 点模型 → 导航回 pick → 恢复初始姿态`。
 
-头/腕都保持工作模式，**不要**重启 capture 切数采 para_dir（会把 XCU WBC 的 `target_server` 打掉）。两个 `040000` checkpoint 都使用四路相机（`head_left`、`head_right`、`left_arm`、`right_arm`）、23 维状态和 23 维动作。pick profile 将图像 letterbox 到 480×640；place profile 将图像 letterbox 到 224×224。
+头/腕都保持工作模式，**不要**重启 capture 切数采 para_dir（会把 XCU WBC 的 `target_server` 打掉）。新 pick checkpoint 使用三路相机（`head_right`、`left_arm`、`right_arm`）、23 维状态和 16 维动作；旧 place checkpoint 使用四路相机、23 维状态和 23 维动作。两个 profile 的网络输入都是 224×224。
 
 `infer_server.py` 复用 `../infer_policy` 的 VLA 推理循环、`RobotController`
 和 `navigate_to_goal`（地图坐标系），但只初始化一次 G1。服务启动时
@@ -22,7 +22,7 @@
    - `pick`：取料点名（地图原点 `[0,0,0,0,0,0,1]`）
    - `place`：放置点名（示教记下的地图位姿）
    并将两个 instruction 改为各自训练时的原始文本。
-3. 服务启动前会分别读取两个 checkpoint 的 `config.json`，校验四路相机、23 维状态、23 维动作、关节顺序和图像尺寸。腿和头虽然存在于模型输出中，但对应 `joint_groups` 保持 disabled，当前只下发双臂和双夹爪。
+3. 服务启动前会分别读取两个 checkpoint 的 `config.json`，按 profile 校验相机、23 维状态、16/23 维动作、关节顺序和图像尺寸。新 pick 模型缺少的腿/头维度会用实时关节状态补齐；所有 profile 的 `leg`、`head` joint groups 都保持 disabled，当前只下发双臂和双夹爪。
 
 示教新点可用 `project_yuqiz/g1_move/slam/record_nav_points.py`，再把名字写进 `task.yaml`。
 
@@ -39,12 +39,12 @@ CUDA_VISIBLE_DEVICES=7 python -m lerobot.async_inference.policy_server --host=12
 真机的两个终端执行：
 
 ```bash
-cd /home/zhangyuqi/zhangyuqi/G1-20260821/sorting_task/9.10/behavior_tree
+cd /home/zhangyuqi/zhangyuqi/G1-20260911/sorting_task/behavior_tree2.0/behavior_tree
 python3 infer_server.py --config infer_server.yaml
 python3 behavior_tree.py --config task.yaml
 ```
 
-启动 `infer_server` 时**不切**头相机模式。启动日志应出现 `head camera startup switch disabled`，随后 `Motion init: True`。日志还应显示 `model_at_a` 的四路 shape 为 480×640、`model_at_b` 为 224×224，且两者 action_dim 都为 23。
+启动 `infer_server` 时**不切**头相机模式。启动日志应出现 `head camera startup switch disabled`，随后 `Motion init: True`。日志还应显示 `model_at_a` 为三路 224×224、16 维动作，`model_at_b` 为四路 224×224、23 维动作。
 
 `infer_server.py` 会并行连接两个模型。可请求 `GET /health` 查看
 `profile_status` 和 `all_profiles_ready`；两个模型都 ready 后再启动行为树。
