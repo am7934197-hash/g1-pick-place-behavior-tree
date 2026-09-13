@@ -15,7 +15,7 @@ head_camera:
 vla_profiles:
   model_at_a:
     # New pick checkpoint: head_right + two wrist cameras, all 224x224.
-    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/models/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
     policy_server_address: "127.0.0.1:30017"
     force_setup_policy: true
     image_preprocess:

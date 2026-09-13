@@ -4,19 +4,6 @@ from __future__ import annotations
 
 from typing import List
 
-PICK_CHECKPOINT = (
-    "/home/zhangyuqi/zhangyuqi/models/g1/pick_place_0911_clean179/"
-    "checkpoints/040000/pretrained_model"
-)
-PLACE_CHECKPOINT = (
-    "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/place/"
-    "checkpoints/040000/pretrained_model"
-)
-ALLOWED_CHECKPOINTS = (PICK_CHECKPOINT, PLACE_CHECKPOINT)
-# Compatibility alias for older diagnostics importing this name.
-PINNED_CHECKPOINT = PICK_CHECKPOINT
-FORBIDDEN_CHECKPOINT_MARKERS = ("010000", "/last", "\\last", "checkpoints/last")
-
 REQUIRED_CHECKPOINT_FILES = (
     "config.json",
     "model.safetensors",

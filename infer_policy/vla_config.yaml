@@ -12,7 +12,7 @@ auto_setup_policy: true  # 启动时自动探测远端模型：已加载则跳�
 # 默认的新 pick 模型使用 3 路相机、23 维状态和 16 维动作。
 # behavior_tree/infer_server.yaml 会为旧 place profile 补回第 4 路相机。
 policy_type: "pi05"
-pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/models/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
+pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
 force_setup_policy: true  # 强制按上面路径加载，避免远端已有旧模型时跳过 setup
 device: "cuda"  # 推理设备：cuda / cpu
 
@@ -32,7 +32,7 @@ inference_optimization:
 
 # ---- 推理参数 ----
 actions_per_chunk: 50         # 每次推理返回的动作帧数
-execute_actions_per_chunk: 10 # 执行前 N 帧后立即重新推理（RTC 模式下自动忽略此参数）
+execute_actions_per_chunk: 5 # 执行前 N 帧后立即重新推理（RTC 模式下自动忽略此参数）
 fps: 30
 
 
@@ -194,13 +194,12 @@ robot:
   # 初始姿态 — 按关节组名 key，值是各关节目标位置列表
   # 组名需与 joint_groups.name 一致；夹爪值 0~0.12（物理宽度），会被 _gripper_command_position 转换
   init_joint_positions:
-    # 新数据 task 0（A+A）的 episode 首帧中位数。
-    right_arm: [-1.085722, 0.586364, 0.691154, 1.415937, 0.352408, -0.202317, -1.538150]
+    right_arm: [-1.148423, 0.602304, 0.744699, 1.483263, 0.355501, -0.218664, -1.418644]
     right_gripper: [0.0]
-    left_arm: [0.790863, -0.594513, -0.110183, -1.619236, -0.285080, 0.030295, 1.149216]
+    left_arm: [0.761190, -0.624880, -0.110855, -1.601858, -0.269837, 0.051077, 1.184783]
     left_gripper: [0.0]
-    leg: [0.576609, 1.462627, 0.925278, 0.040399, 0.000090]
-    head: [-0.074925, 0.430006]
+    leg: [0.576957, 1.461440, 0.926045, 0.040099, 0.000959]
+    head: [-0.074961, 0.429958]
 
   # /restore_initial_pose succeeds only after fresh SDK feedback confirms that
   # the robot actually reached this configured preparation pose.

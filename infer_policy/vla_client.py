@@ -232,14 +232,26 @@ class RemotePolicyConfig:
         self.acp_cfg_beta = 1.0
 
 
-# Register a stub module so pickle believes these classes live in
-# lerobot.async_inference.helpers, which exists on the remote PolicyServer.
-# This avoids the need to install vla_client on the server.
-for _mod_name in ("lerobot.async_inference.helpers", "lerobot.async_inference"):
-    if _mod_name not in sys.modules:
-        sys.modules[_mod_name] = _types.ModuleType(_mod_name)
+# Register stub packages so pickle can resolve these classes as
+# lerobot.async_inference.helpers.*, which exists on the remote PolicyServer.
+# pickle.dumps() calls __import__('lerobot.async_inference.helpers'), so the
+# parent packages must exist locally even when LeRobot is not installed.
+def _ensure_stub_module(name: str, is_package: bool) -> _types.ModuleType:
+    existing = sys.modules.get(name)
+    if existing is None:
+        existing = _types.ModuleType(name)
+        existing.__package__ = name if is_package else name.rpartition(".")[0]
+        if is_package:
+            existing.__path__ = []
+        sys.modules[name] = existing
+    return existing
 
-_helpers_mod = sys.modules["lerobot.async_inference.helpers"]
+
+_lerobot_mod = _ensure_stub_module("lerobot", True)
+_async_mod = _ensure_stub_module("lerobot.async_inference", True)
+_helpers_mod = _ensure_stub_module("lerobot.async_inference.helpers", False)
+_lerobot_mod.async_inference = _async_mod
+_async_mod.helpers = _helpers_mod
 _helpers_mod.TimedObservation = TimedObservation
 _helpers_mod.TimedAction = TimedAction
 _helpers_mod.RemotePolicyConfig = RemotePolicyConfig

@@ -17,7 +17,7 @@ point_a:
   profile: "model_at_a"
   # Must exactly match the instruction used when training model_at_a.
   instruction: "Left arm pick up A. Right arm pick up A."
-  max_steps: 800
+  max_steps: 500
 
 point_b:
   profile: "model_at_b"
