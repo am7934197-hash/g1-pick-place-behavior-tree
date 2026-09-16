@@ -126,16 +126,37 @@ class InferServerPreloadTest(unittest.TestCase):
 
     def test_profiles_match_checkpoint_shapes(self):
         configs = infer_server._configured_profiles()
+        self.assertNotIn(
+            "observation.images.head_left", configs["model_at_a"]["observation_features"]
+        )
         self.assertEqual(
-            configs["model_at_a"]["observation_features"]["observation.images.head_left"]["shape"],
-            [480, 640, 3],
+            configs["model_at_a"]["observation_features"]["observation.images.head_right"]["shape"],
+            [224, 224, 3],
         )
         self.assertEqual(
             configs["model_at_b"]["observation_features"]["observation.images.head_left"]["shape"],
             [224, 224, 3],
         )
-        self.assertEqual(configs["model_at_a"]["robot"]["vla_action_dim"], 23)
-        self.assertEqual(configs["model_at_b"]["robot"]["vla_action_dim"], 23)
+        self.assertEqual(configs["model_at_a"]["robot"]["vla_action_dim"], 16)
+        self.assertEqual(configs["model_at_b"]["robot"]["vla_action_dim"], 16)
+
+    def test_switch_refreshes_active_observation_schema(self):
+        infer_server.preload_profiles()
+        infer_server.REFERENCE.REQUIRED_CAMERAS = []
+        infer_server.REFERENCE.REQUIRED_STATE_NAMES = []
+
+        infer_server.activate_profile("model_at_a")
+        self.assertEqual(
+            set(infer_server.REFERENCE.REQUIRED_CAMERAS),
+            {"head_right", "left_arm", "right_arm"},
+        )
+        self.assertEqual(len(infer_server.REFERENCE.REQUIRED_STATE_NAMES), 23)
+
+        infer_server.activate_profile("model_at_b")
+        self.assertEqual(
+            set(infer_server.REFERENCE.REQUIRED_CAMERAS),
+            {"head_left", "head_right", "left_arm", "right_arm"},
+        )
 
     def test_restore_initial_pose_reuses_owned_robot(self):
         robot = SimpleNamespace(set_init_pose=lambda: True)

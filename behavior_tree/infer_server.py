@@ -188,8 +188,8 @@ def _profile_config(name: str) -> dict[str, Any]:
         raise ValueError(f"Unknown VLA profile '{name}'")
     if not profile.get("pretrained_name_or_path"):
         raise ValueError(f"vla_profiles.{name}.pretrained_name_or_path must be configured")
-    # Robot ownership/mapping is shared, while image feature shapes may differ
-    # between checkpoints (pick=480x640, place=224x224).
+    # Robot ownership/mapping is shared. Profiles may override model inputs;
+    # the current pair differs in camera count and action dimension.
     forbidden = {"robot", "observation_mapping"}.intersection(profile)
     if forbidden:
         raise ValueError(f"Profile '{name}' cannot override shared robot/observation config: {sorted(forbidden)}")
@@ -198,7 +198,7 @@ def _profile_config(name: str) -> dict[str, Any]:
 
 def _validate_profile_schema(name: str, config: dict[str, Any]) -> None:
     """Match one profile to its local checkpoint before any robot motion."""
-    from alignment_schema import CAMERA_KEYS, STATE_NAMES
+    from alignment_schema import STATE_NAMES
 
     checkpoint_path = Path(config["pretrained_name_or_path"]) / "config.json"
     if not checkpoint_path.is_file():
@@ -221,18 +221,29 @@ def _validate_profile_schema(name: str, config: dict[str, Any]) -> None:
             f"checkpoint={sorted(checkpoint_features)}"
         )
 
-    expected_camera_keys = {f"observation.images.{camera}" for camera in CAMERA_KEYS}
     actual_camera_keys = {
         key for key, feature in checkpoint_features.items()
         if (feature or {}).get("type") == "VISUAL"
     }
-    if actual_camera_keys != expected_camera_keys:
+    supported_camera_sets = {
+        frozenset({
+            "observation.images.head_right",
+            "observation.images.left_arm",
+            "observation.images.right_arm",
+        }),
+        frozenset({
+            "observation.images.head_left",
+            "observation.images.head_right",
+            "observation.images.left_arm",
+            "observation.images.right_arm",
+        }),
+    }
+    if frozenset(actual_camera_keys) not in supported_camera_sets:
         raise ValueError(
-            f"Profile '{name}' must use cameras {sorted(expected_camera_keys)}, "
-            f"got {sorted(actual_camera_keys)}"
+            f"Profile '{name}' camera schema is unsupported: {sorted(actual_camera_keys)}"
         )
     image_hw: set[tuple[int, int]] = set()
-    for key in expected_camera_keys:
+    for key in actual_camera_keys:
         checkpoint_shape = list((checkpoint_features[key] or {}).get("shape") or [])
         configured_shape = list((configured_features[key] or {}).get("shape") or [])
         if len(checkpoint_shape) != 3 or len(configured_shape) != 3:
@@ -263,12 +274,24 @@ def _validate_profile_schema(name: str, config: dict[str, Any]) -> None:
         (((checkpoint.get("output_features") or {}).get("action") or {}).get("shape") or [])
     )
     action_names = list(checkpoint.get("action_feature_names") or [])
-    if output_shape != [23] or action_names != STATE_NAMES:
+    supported_action_schemas = {
+        16: list(STATE_NAMES[:16]),
+        23: list(STATE_NAMES),
+    }
+    if len(output_shape) != 1 or output_shape[0] not in supported_action_schemas:
         raise ValueError(
             f"Profile '{name}' action schema mismatch: shape={output_shape}, names={action_names}"
         )
-    if int(((config.get("robot") or {}).get("vla_action_dim", 0))) != 23:
-        raise ValueError(f"Profile '{name}' requires robot.vla_action_dim=23")
+    expected_action_names = supported_action_schemas[output_shape[0]]
+    if action_names and action_names != expected_action_names:
+        raise ValueError(
+            f"Profile '{name}' action names mismatch: expected={expected_action_names}, "
+            f"got={action_names}"
+        )
+    # The shared controller is configured for the short prefix.  It accepts
+    # either that prefix or the complete 23-D legacy action vector.
+    if int(((config.get("robot") or {}).get("vla_action_dim", 0))) != 16:
+        raise ValueError(f"Profile '{name}' requires shared robot.vla_action_dim=16")
     if not checkpoint.get("use_relative_actions", False):
         raise ValueError(f"Profile '{name}' must use relative actions")
     if list(checkpoint.get("relative_exclude_joints") or []) != ["gripper"]:
@@ -388,6 +411,16 @@ def activate_profile(name: str) -> None:
     # run_vla reads these module globals on every action chunk.
     REFERENCE.CFG = runtime.config
     REFERENCE.VLA_CFG = {**runtime.config, **(runtime.config.get("grpc") or {})}
+    REFERENCE.REQUIRED_CAMERAS = [
+        key.rsplit(".", 1)[-1]
+        for key, feature in (runtime.config.get("observation_features") or {}).items()
+        if (feature or {}).get("dtype") == "image"
+    ]
+    REFERENCE.REQUIRED_STATE_NAMES = list(
+        (((runtime.config.get("observation_features") or {}).get("observation.state") or {}).get("names"))
+        or ((runtime.config.get("robot") or {}).get("state_feature_names"))
+        or []
+    )
     REFERENCE.vla = runtime.client
     REFERENCE.image_preprocessor = runtime.image_preprocessor
     ACTIVE_PROFILE = name

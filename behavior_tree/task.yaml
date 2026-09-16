@@ -1,5 +1,5 @@
 # The robot is assumed to already be at chassis point pick (map origin).
-# Before point-A VLA, the tree restores the ready_224 training joint pose
+# Before point-A VLA, the tree restores the clean_ready_224 task-0 median pose
 # from vla_config.yaml.
 infer_server:
   url: "http://127.0.0.1:8006"
@@ -16,8 +16,8 @@ navigation:
 point_a:
   profile: "model_at_a"
   # Must exactly match the instruction used when training model_at_a.
-  instruction: "Left arm pick up part A and right arm pick up part A"
-  max_steps: 800
+  instruction: "Left arm pick up A. Right arm pick up A."
+  max_steps: 500
 
 point_b:
   profile: "model_at_b"
@@ -28,4 +28,4 @@ point_b:
 # Place 成功后，行为树会自动：
 #   1. 用地图导航回到 pick（原点）；
 #   2. 恢复 vla_config.yaml 中 robot.init_joint_positions 的初始姿态。
-# 头/腕保持工作模式；原图直接 letterbox 到 224，不再裁 4:3、不再经过 640x480。
+# 头/腕保持工作模式；新 pick 与旧 place 均直接 letterbox 到 224。
