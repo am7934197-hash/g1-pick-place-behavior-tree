@@ -12,7 +12,7 @@ time.sleep(2)
 
 # 当前 030000 checkpoint 使用的 ready_224 数据集中，52 条抓取
 # episode 第一帧的逐关节中位数。必须与 vla_config.yaml init_joint_positions 一致。
-joint_pos = [0.7611904144287109, -0.6248801946640015, -0.11085458844900131, -1.6018580198287964, -0.2698366343975067, 0.05107705667614937, 1.1847834587097168]
+joint_pos = [0.853, -0.758, -0.193, -1.302, -0.467, -0.381, 1.382]
 # Set head joint group; if empty, defaults to whole body joints ["leg", "head", "left_arm", "right_arm"]
 joint_groups = ["left_arm"]
 # Whether to block until joints reach target

@@ -16,6 +16,7 @@ vla_profiles:
   model_at_a:
     # New pick checkpoint: head_right + two wrist cameras, all 224x224.
     pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
+    #pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0914/only_pick/checkpoints/015000/pretrained_model"
     policy_server_address: "127.0.0.1:30017"
     force_setup_policy: true
     image_preprocess:
@@ -23,7 +24,7 @@ vla_profiles:
 
   model_at_b:
     # Place checkpoint was trained with four 224x224 camera inputs.
-    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260821/g1/place/checkpoints/040000/pretrained_model"
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0914/only_place/checkpoints/015000/pretrained_model"
     # A second PolicyServer process, also running on CUDA device 7.
     policy_server_address: "127.0.0.1:30018"
     force_setup_policy: true

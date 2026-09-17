@@ -12,7 +12,7 @@ auto_setup_policy: true  # 启动时自动探测远端模型：已加载则跳�
 # 默认的新 pick 模型使用 3 路相机、23 维状态和 16 维动作。
 # behavior_tree/infer_server.yaml 会为旧 place profile 补回第 4 路相机。
 policy_type: "pi05"
-pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
+pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0914/only_pick/checkpoints/015000/pretrained_model"
 force_setup_policy: true  # 强制按上面路径加载，避免远端已有旧模型时跳过 setup
 device: "cuda"  # 推理设备：cuda / cpu
 
@@ -32,7 +32,7 @@ inference_optimization:
 
 # ---- 推理参数 ----
 actions_per_chunk: 50         # 每次推理返回的动作帧数
-execute_actions_per_chunk: 5 # 执行前 N 帧后立即重新推理（RTC 模式下自动忽略此参数）
+execute_actions_per_chunk: 15 # 执行前 N 帧后立即重新推理（RTC 模式下自动忽略此参数）
 fps: 30
 
 

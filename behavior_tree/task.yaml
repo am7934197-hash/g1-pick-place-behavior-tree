@@ -22,8 +22,8 @@ point_a:
 point_b:
   profile: "model_at_b"
   # Required: must exactly match the instruction used when training model_at_b.
-  instruction: "Left arm places part A in the lower-left corner of the sorting box and right arm places part A in the lower-left corner of the sorting box."
-  max_steps: 800
+  instruction: "Left arm places A in the top-left corner. Right arm places A in the top-left corner."
+  max_steps: 500
 
 # Place 成功后，行为树会自动：
 #   1. 用地图导航回到 pick（原点）；
