@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -64,6 +65,18 @@ class EmulateDataCollectionPreprocessTest(unittest.TestCase):
         content = out["left_arm"][28:196]
         self.assertEqual(out["left_arm"].shape, (224, 224, 3))
         self.assertGreater(int(content[:, :24, 1].max()), 200)
+
+    def test_ready_480x640_wrists_skip_legacy_fov_emulation(self):
+        wrist = np.full((480, 640, 3), 160, dtype=np.uint8)
+        with patch("image_preprocessor.emulate_fov", side_effect=AssertionError):
+            out = self.pp.process({
+                "left_arm": wrist.copy(),
+                "right_arm": wrist.copy(),
+            })
+
+        for camera in ("left_arm", "right_arm"):
+            self.assertEqual(out[camera].shape, (224, 224, 3))
+            self.assertEqual(count_letterbox_black_bar_rows(out[camera]), (28, 28))
 
     def _pp(self, scheme: str) -> ImagePreprocessor:
         cfg = {

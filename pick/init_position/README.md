@@ -37,7 +37,7 @@ python3 set_init_right_arm_positions.py
 
 下列数值是当前 `020000` checkpoint 所用 `ready_224` 数据集中，
 52 条抓取 episode 第一帧的逐关节中位数。这些值与
-`infer_policy/vla_config.yaml` 的 `robot.init_joint_positions` 保持一致。
+`behavior_tree/config.yaml` 的 `robot.init_joint_positions` 保持一致。
 
 | 脚本 | 关节组 | 目标位置（rad） |
 |------|--------|-----------------|

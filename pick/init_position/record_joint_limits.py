@@ -5,7 +5,7 @@
   1. 慢速把目标机械臂摆到你认为安全的各个边界
   2. 本脚本持续记录每个关节的 min/max
   3. 结束后向内缩安全余量，再与 URDF 硬件限位取交集
-  4. 打印可直接粘贴到 vla_config.yaml 的 joint_limits
+  4. 打印可直接粘贴到 config.yaml 的 joint_limits
 
 本脚本只读关节状态，默认不下发运动。手臂需用示教器 / 平板拖动，
 或机器人已有的慢速点动来摆。不要与 infer_policy/server.py 同时占用 SDK。
@@ -32,7 +32,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from galbot_sdk.g1 import GalbotRobot
 
 
-# 与 vla_config.yaml state_feature_names / joint_limits 顺序一致。
+# 与 config.yaml state_feature_names / joint_limits 顺序一致。
 STATE_NAMES: List[str] = [
     "right_arm_joint1",
     "right_arm_joint2",
@@ -137,7 +137,7 @@ EXISTING_LIMITS: Dict[str, Tuple[float, float]] = {
 
 NEAR_HW_RAD = 0.02
 DEFAULT_CONFIG = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "infer_policy", "vla_config.yaml")
+    os.path.join(os.path.dirname(__file__), "..", "..", "behavior_tree", "config.yaml")
 )
 
 
@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG,
-        help="现有 vla_config.yaml，未摆到的关节沿用其中限位",
+        help="现有 config.yaml，未摆到的关节沿用其中限位",
     )
     parser.add_argument(
         "--apply",
@@ -363,11 +363,15 @@ def backup_and_apply(config_path: str, yaml_block: str) -> str:
     start = text.find("    joint_limits:")
     if start < 0:
         raise RuntimeError("config 里找不到 joint_limits")
-    # 替换到下一个同级或更高级键之前（action_filter）
-    end_marker = "\n    action_filter:"
-    end = text.find(end_marker, start)
-    if end < 0:
-        raise RuntimeError("config 里找不到 action_filter，无法安全替换 joint_limits")
+    lines = text[start:].splitlines(keepends=True)
+    consumed = len(lines[0])
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#") or line.startswith("      "):
+            consumed += len(line)
+            continue
+        break
+    end = start + consumed
     backup = config_path + ".bak." + datetime.now().strftime("%Y%m%d_%H%M%S")
     with open(backup, "w", encoding="utf-8") as f:
         f.write(text)
@@ -456,7 +460,7 @@ def main() -> int:
             extra = " -> [{:.4f}, {:.4f}]".format(lohi[0], lohi[1])
         print("  {:<20} {}{}".format(name, status.get(name, "?"), extra))
 
-    print("\n未更新的关节仍沿用现有 vla_config 限位。")
+    print("\n未更新的关节仍沿用现有 config.yaml 限位。")
     print("\n可粘贴的 YAML:\n")
     print(yaml_block)
 

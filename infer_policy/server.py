@@ -3,8 +3,8 @@ Galbot VLA Client Server — VLA-Only Mode.
 
 职责: 获取观测 → VLA 推理 → 执行动作。无导航、无放置、无任务流水线。
 
-配置: vla_config.yaml (包含 VLA 模型、机器人硬件、HTTP 服务全部参数)
-用法: python server.py [--config vla_config.yaml]
+配置: ../behavior_tree/config.yaml
+用法: python server.py [--config ../behavior_tree/config.yaml]
 """
 
 import os
@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from robot_controller import RobotController
-from vla_client import VLAClient
+from vla_client import VLAClient, summarize_infer_rpc_samples
 from rtc_controller import RTCController
 import inference_logger as logger
 from inference_logger import VLAInferenceLogger
@@ -32,9 +32,11 @@ from image_preprocessor import ImagePreprocessor
 from alignment_schema import (
     ACTION_NAMES,
     CAMERA_KEYS,
+    GRIPPER_INDICES,
     STATE_NAMES,
     TRAINING_FPS,
     TRAINING_LETTERBOX_PAD_TBLR,
+    apply_vla_defaults,
 )
 from checkpoint_guard import format_checkpoint_report, inspect_checkpoint_files, resolve_checkpoint_path
 
@@ -43,16 +45,16 @@ from checkpoint_guard import format_checkpoint_report, inspect_checkpoint_files,
 # 配置加载
 # ------------------------------------------------------------------
 
-def load_config(config_path: str = "vla_config.yaml") -> dict:
+def load_config(config_path: str) -> dict:
     if not os.path.exists(config_path):
         print(f"Config file not found: {config_path}")
         sys.exit(1)
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return apply_vla_defaults(yaml.safe_load(f) or {})
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = "vla_config.yaml"
+CONFIG_PATH = os.path.join(os.path.dirname(_SCRIPT_DIR), "behavior_tree", "config.yaml")
 if len(sys.argv) > 1 and sys.argv[1] == "--config":
     CONFIG_PATH = sys.argv[2]
 if not os.path.isabs(CONFIG_PATH):
@@ -164,6 +166,14 @@ def validate_runtime_config():
             )
         if int(rtc_cfg.get("warmup_inferences", 0) or 0) < 1:
             raise ValueError("RTC requires warmup_inferences >= 1 so compile output is never executed")
+        if int(rtc_cfg.get("execution_horizon", 10)) <= 0:
+            raise ValueError("RTC execution_horizon must be > 0")
+        if float(rtc_cfg.get("max_guidance_weight", 10.0)) <= 0:
+            raise ValueError("RTC max_guidance_weight must be > 0")
+        if str(rtc_cfg.get("prefix_attention_schedule", "LINEAR")).upper() not in {
+            "ZEROS", "ONES", "LINEAR", "EXP"
+        }:
+            raise ValueError("unsupported RTC prefix_attention_schedule")
     interpolation = control.get("interpolation") or {}
     if interpolation.get("enabled", False):
         input_hz = float(interpolation.get("input_hz", CFG.get("fps", 30)))
@@ -189,7 +199,11 @@ def validate_runtime_config():
             "the policy must not drive the head cameras"
         )
 
-    checkpoint_dir = resolve_checkpoint_path(CFG.get("pretrained_name_or_path"))
+    checkpoint_path = CFG.get("pretrained_name_or_path")
+    if not checkpoint_path:
+        logger.debug("No top-level checkpoint; profiles are managed by the behavior-tree server")
+        return
+    checkpoint_dir = resolve_checkpoint_path(checkpoint_path)
     CFG["pretrained_name_or_path"] = checkpoint_dir
     VLA_CFG["pretrained_name_or_path"] = checkpoint_dir
     file_info = inspect_checkpoint_files(checkpoint_dir)
@@ -446,7 +460,7 @@ _recovery_in_progress = threading.Event()  # 右方向键恢复期间拒绝新�
 _recovery_guard = threading.Lock()
 inference_logger = VLAInferenceLogger(CFG.get("inference_log", {}))
 image_preprocessor = ImagePreprocessor(CFG.get("image_preprocess", {}))
-logger.info(
+_preprocess_log = (
     "image_preprocess enabled=%s target_size=[%s, %s] keep_aspect_ratio=%s "
     "crop_to_training_aspect=%s training_hw=%s "
     "emulate_data_collection=%s scheme=%s cameras=%s zoom=%s out_wh=%s "
@@ -465,6 +479,10 @@ logger.info(
         list(image_preprocessor._emulate_out_wh),
     )
 )
+if (CFG.get("startup_logging") or {}).get("verbose_preprocess", True):
+    logger.info(_preprocess_log)
+else:
+    logger.debug(_preprocess_log)
 
 # ------------------------------------------------------------------
 # 生命周期
@@ -606,6 +624,67 @@ def _request_interactive_recovery(source: str) -> bool:
     return True
 
 
+class InferBreakdown:
+    """Accumulate local robot time vs PolicyServer RPC time for one VLA stage."""
+
+    def __init__(self, rtt_ms: float = 0.0) -> None:
+        self._lock = threading.Lock()
+        self.rtt_ms = float(rtt_ms or 0.0)
+        self.samples: list = []
+        self.obs_ms = 0.0
+        self.prep_ms = 0.0
+        self.robot_ms = 0.0
+        self.pump_ms = 0.0
+
+    def add_infer(self, client) -> dict:
+        timing = {}
+        take = getattr(client, "take_last_infer_timing", None) if client is not None else None
+        if callable(take):
+            timing = take() or {}
+        elif client is not None:
+            timing = dict(getattr(client, "last_infer_timing", None) or {})
+        with self._lock:
+            self.samples.append(dict(timing))
+        return timing
+
+    def add_obs(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self.obs_ms += float(elapsed_ms)
+
+    def add_prep(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self.prep_ms += float(elapsed_ms)
+
+    def add_robot(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self.robot_ms += float(elapsed_ms)
+
+    def set_pump(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self.pump_ms = float(elapsed_ms)
+
+    def as_dict(self) -> dict:
+        with self._lock:
+            summary = summarize_infer_rpc_samples(self.samples, rtt_ms=self.rtt_ms)
+            summary.update({
+                "obs_ms": self.obs_ms,
+                "prep_ms": self.prep_ms,
+                "robot_exec_ms": self.robot_ms,
+                "pump_ms": self.pump_ms,
+            })
+            return summary
+
+
+def _probe_policy_rtt_ms() -> float:
+    probe = getattr(vla, "probe_rtt_ms", None)
+    if not callable(probe):
+        return 0.0
+    try:
+        return max(0.0, float(probe() or 0.0))
+    except Exception:
+        return 0.0
+
+
 def _obs_meta() -> dict:
     if robot is None:
         now = time.time()
@@ -621,7 +700,7 @@ def _capture_and_preprocess():
     return obs, _obs_meta()
 
 
-def _warmup_policy(instruction: str, warmup_n: int) -> dict:
+def _warmup_policy(instruction: str, warmup_n: int, breakdown: Optional[InferBreakdown] = None) -> dict:
     """Run compile/warmup inferences and DISCARD every returned chunk.
 
     The first torch.compile packet is ~2.9s. It must finish before motion starts.
@@ -632,7 +711,10 @@ def _warmup_policy(instruction: str, warmup_n: int) -> dict:
     times_ms = []
     for i in range(warmup_n):
         with _robot_lock:
+            t_obs = time.perf_counter()
             obs, meta = _capture_and_preprocess()
+            if breakdown is not None:
+                breakdown.add_obs((time.perf_counter() - t_obs) * 1000)
         if obs is None or not validate_observation(obs):
             return {
                 "success": False,
@@ -645,6 +727,8 @@ def _warmup_policy(instruction: str, warmup_n: int) -> dict:
         actions = vla.infer(obs, instruction, timestep=-1 - i)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         times_ms.append(elapsed_ms)
+        if breakdown is not None:
+            breakdown.add_infer(vla)
         n_act = len(actions) if actions else 0
         logger.info(
             f"WARMUP infer {i + 1}/{warmup_n}: {elapsed_ms:.0f}ms actions={n_act} "
@@ -657,7 +741,10 @@ def _warmup_policy(instruction: str, warmup_n: int) -> dict:
                 "warmup_ms": times_ms,
                 "message": "Warmup inference returned no actions",
             }
-    return {"success": True, "warmup_inferences": warmup_n, "warmup_ms": times_ms}
+    result = {"success": True, "warmup_inferences": warmup_n, "warmup_ms": times_ms}
+    if breakdown is not None:
+        result["timing_breakdown"] = breakdown.as_dict()
+    return result
 
 
 def run_vla(instruction: str, max_steps: int = 2000) -> dict:
@@ -672,11 +759,21 @@ def run_vla(instruction: str, max_steps: int = 2000) -> dict:
         return {"success": False, "message": "Policy setup has not completed successfully", "details": None}
 
     rtc_cfg = CFG.get("rtc", {})
+    rtt_ms = _probe_policy_rtt_ms()
+    if rtt_ms:
+        logger.info(f"PolicyServer RTT probe: {rtt_ms:.0f}ms")
+    warmup_breakdown = InferBreakdown(rtt_ms=rtt_ms)
+    loop_breakdown = InferBreakdown(rtt_ms=rtt_ms)
     # Compile/warmup must be the first operation after read-only diagnostics.
     # In particular, do not move the grippers before the multi-second compile
     # packet has completed and been discarded.
-    warmup = _warmup_policy(instruction, int(rtc_cfg.get("warmup_inferences", 0) or 0))
+    t_ready = time.perf_counter()
+    warmup = _warmup_policy(
+        instruction, int(rtc_cfg.get("warmup_inferences", 0) or 0), warmup_breakdown,
+    )
     if not warmup.get("success", True):
+        warmup["wall_ms"] = (time.perf_counter() - t_ready) * 1000
+        warmup["timing_breakdown"] = warmup_breakdown.as_dict()
         return {
             "success": False,
             "message": warmup.get("message", "Policy warmup failed"),
@@ -685,31 +782,43 @@ def run_vla(instruction: str, max_steps: int = 2000) -> dict:
 
     if robot.robot is not None:
         if not robot.set_training_start_grippers():
+            warmup["wall_ms"] = (time.perf_counter() - t_ready) * 1000
+            warmup["timing_breakdown"] = warmup_breakdown.as_dict()
             return {
                 "success": False,
                 "message": "Failed to set training-start gripper widths (0.0 m) after warmup",
                 "details": {"warmup": warmup},
             }
+    warmup["wall_ms"] = (time.perf_counter() - t_ready) * 1000
+    warmup["timing_breakdown"] = warmup_breakdown.as_dict()
 
+    t_infer = time.perf_counter()
     if rtc_cfg.get("enabled", False):
-        result = _run_vla_rtc(instruction, max_steps, rtc_cfg)
+        result = _run_vla_rtc(instruction, max_steps, rtc_cfg, loop_breakdown)
     else:
-        result = _run_vla_sync(instruction, max_steps)
+        result = _run_vla_sync(instruction, max_steps, loop_breakdown)
+    inference_wall_ms = (time.perf_counter() - t_infer) * 1000
 
     details = result.get("details")
     if details is None:
         details = {}
         result["details"] = details
     details["warmup"] = warmup
+    details["inference_wall_ms"] = inference_wall_ms
+    details["total_wall_ms"] = float(warmup.get("wall_ms") or 0.0) + inference_wall_ms
+    details["timing_breakdown"] = loop_breakdown.as_dict()
+    details["policy_rtt_ms"] = rtt_ms
     return result
 
 
-def _run_vla_sync(instruction: str, max_steps: int) -> dict:
+def _run_vla_sync(instruction: str, max_steps: int, breakdown: Optional[InferBreakdown] = None) -> dict:
     """同步推理模式（原有逻辑）。"""
     execute_count = CFG.get("execute_actions_per_chunk", 10)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     control = ROBOT_CFG.get("control", {})
     dt = control.get("dt", 0.033)
+    if breakdown is None:
+        breakdown = InferBreakdown()
 
     inference_logger.start_run(run_id, instruction)
 
@@ -723,7 +832,9 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
     robot.reset_action_filter()
     if hasattr(robot, "_pump_cameras"):
         logger.info("Pumping cameras on execute thread...")
+        t_pump = time.perf_counter()
         robot._pump_cameras(duration=5.0, interval=0.1)
+        breakdown.set_pump((time.perf_counter() - t_pump) * 1000)
 
     while step < max_steps:
         if _stop_event.is_set():
@@ -735,6 +846,7 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
         t0_obs = time.perf_counter()
         obs = robot.get_observation(features=CFG.get("observation_features"))
         elapsed_obs_ms = (time.perf_counter() - t0_obs) * 1000
+        breakdown.add_obs(elapsed_obs_ms)
 
         if obs is None:
             logger.warning(f"Failed to get observation at step {step}, retrying...")
@@ -745,6 +857,7 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
         t0_prep = time.perf_counter()
         obs = image_preprocessor.process(obs)
         elapsed_prep_ms = (time.perf_counter() - t0_prep) * 1000
+        breakdown.add_prep(elapsed_prep_ms)
 
         inference_logger.log_obs(run_id=run_id, step=step, obs=obs, elapsed_ms=elapsed_obs_ms)
         logger.info(f"Get obs: {elapsed_obs_ms:.0f}ms | preprocess: {elapsed_prep_ms:.0f}ms")
@@ -760,6 +873,7 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
         t0 = time.perf_counter()
         actions = vla.infer(obs, instruction, timestep=step)
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        breakdown.add_infer(vla)
 
         # A recovery key may arrive while remote inference is waiting. Never execute
         # the stale chunk after recovery has been requested.
@@ -786,16 +900,22 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
 
         # ---- 4. 下发动作 ----
         with _robot_lock:
+            t_robot = time.perf_counter()
             executed = robot.execute_action_chunk(
                 action_vectors, dt=dt, stop_flag=_stop_event.is_set
             )
+            breakdown.add_robot((time.perf_counter() - t_robot) * 1000)
         if not executed:
             logger.error(f"Action execution failed at step {step}; stopping run")
             inference_logger.end_run(run_id)
             return {
                 "success": False,
                 "message": "Robot rejected or failed to execute action chunk",
-                "details": {"run_id": run_id, "step": step},
+                "details": {
+                    "run_id": run_id,
+                    "step": step,
+                    "timing_breakdown": breakdown.as_dict(),
+                },
             }
         total_actions += len(action_vectors)
 
@@ -812,27 +932,37 @@ def _run_vla_sync(instruction: str, max_steps: int) -> dict:
             "steps": step,
             "total_actions_executed": total_actions,
             "max_steps": max_steps,
+            "timing_breakdown": breakdown.as_dict(),
         },
     }
 
 
-def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
+def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict, breakdown: Optional[InferBreakdown] = None) -> dict:
     """RTC 异步推理模式。
 
     流程:
       1. 首次推理（warmup 已在 run_vla 丢弃 compile 首包）→ fill buffer
       2. 主线程按 30 Hz 单调时钟逐帧取 buffer → 下发（sleep 不含处理时间叠加）
       3. buffer 剩余 ≤ pre_infer_threshold 时，后台线程异步 trigger
-      4. 新 chunk 到达 → 按 frames_elapsed 丢掉过时帧后融合
+      4. 旧动作 prefix 在远端 Pi0.5 flow-matching 内 guidance
+      5. 新 chunk 到达 → 按实际执行帧数丢掉过时帧后替换 buffer
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     control = ROBOT_CFG.get("control", {})
     fps = float(control.get("fps", CFG.get("fps", 30)) or 30)
     period = 1.0 / fps
     dt = float(control.get("dt", period))
+    # RTC targets are sent one frame at a time at the policy frequency.
+    interpolate_actions = False
+    underflow_wait_seconds = float(rtc_cfg.get("underflow_wait_seconds", 0.3))
+    if underflow_wait_seconds <= 0:
+        raise ValueError("RTC underflow_wait_seconds must be > 0")
+    if breakdown is None:
+        breakdown = InferBreakdown()
 
     inference_logger.start_run(run_id, instruction)
     rtc = RTCController(rtc_cfg)
+    logger.info(f"RTC control loop: {fps:g}Hz, one buffered action per cycle")
 
     if hasattr(vla, "update_instruction"):
         vla.update_instruction(instruction)
@@ -849,6 +979,7 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
         logger.error("RTC: initial observation is None")
         inference_logger.end_run(run_id)
         return {"success": False, "message": "Invalid observation"}
+    breakdown.add_obs((time.perf_counter() - t0_first) * 1000)
     inference_logger.log_obs(run_id=run_id, step=0, obs=obs, elapsed_ms=(time.perf_counter() - t0_first) * 1000)
     obs["task"] = instruction
 
@@ -860,7 +991,16 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
     # Initial inference has no concurrently consumed action buffer. Do not set
     # RTC's async-inference latch here: leaving it set would prevent every
     # subsequent should_trigger_inference() call after the first chunk.
-    actions = vla.infer(obs, instruction, timestep=0)
+    initial_context = {
+        "trace_id": f"{rtc.session_id}:initial:0",
+        "previous_actions": [],
+        "previous_action_start_index": 0,
+        "control_step": rtc.control_step,
+        "trajectory_step": rtc.trajectory_step,
+        "fps": fps,
+    }
+    actions = vla.infer(obs, instruction, timestep=0, rtc_context=initial_context)
+    breakdown.add_infer(vla)
     if _stop_event.is_set():
         logger.info("RTC: stop requested while initial inference was running; discarding actions")
         vla.reset()
@@ -875,37 +1015,130 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
     obs_age_s = time.time() - float(meta.get("obs_capture_ts") or time.time())
     stale_frames = int(round(max(0.0, obs_age_s) * fps))
     if stale_frames > 0:
-        if stale_frames >= len(action_vectors):
-            logger.error(
-                f"RTC: initial chunk entirely stale obs_age={obs_age_s * 1000:.0f}ms "
-                f"stale_frames={stale_frames} chunk={len(action_vectors)}"
-            )
-            inference_logger.end_run(run_id)
-            return {"success": False, "message": "Initial chunk entirely stale after inference latency"}
-        logger.warning(
-            f"RTC: initial chunk obs_age={obs_age_s * 1000:.0f}ms -> skip first {stale_frames} actions "
-            f"(do not execute chunk[0] against a {stale_frames}-frame-old state)"
+        logger.info(
+            f"RTC: initial observation age={obs_age_s * 1000:.0f}ms, but robot was held; "
+            "keep the full initial chunk"
         )
-        action_vectors = action_vectors[stale_frames:]
     log_inferred_actions(
         run_id, instruction, 0, obs, actions,
         elapsed_ms=(time.perf_counter() - t0_first) * 1000,
         selected_action_count=len(action_vectors),
     )
-    fusion0 = rtc.add_chunk(action_vectors)
-    fusion0["skipped"] = stale_frames
-    fusion0["start_index"] = stale_frames
-    fusion0["mode"] = "replace_skip_stale" if stale_frames else "replace"
+    install0 = rtc.add_chunk(action_vectors)
     first_infer_ms = (time.perf_counter() - t0_first) * 1000
     logger.info(
         f"RTC: initial inference done in {first_infer_ms:.0f}ms, buffer={rtc.buffer_remaining()} frames "
-        f"fusion={fusion0}"
+        f"install={install0}"
     )
 
     step = 0
     async_thread = None
     next_t = time.perf_counter()
+    control_loop_started_at = next_t
     failure_message = None
+    active_infer_started_at = None
+    active_infer_seq = None
+    last_pending_latency_log_at = 0.0
+
+    def _log_pending_infer_latency(force: bool = False) -> None:
+        nonlocal last_pending_latency_log_at
+        if not rtc.infer_in_progress or active_infer_started_at is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_pending_latency_log_at < 0.5:
+            return
+        last_pending_latency_log_at = now
+        logger.warning(
+            f"RTC latency: status=pending infer_seq={active_infer_seq} "
+            f"elapsed_ms={(now - active_infer_started_at) * 1000:.0f} "
+            f"control_step={rtc.control_step} trajectory_step={rtc.trajectory_step} "
+            f"buffer_remaining={rtc.buffer_remaining()}"
+        )
+
+    def _log_chunk_report(report: Optional[dict], prefix: str = "RTC chunk received") -> None:
+        report = report or {}
+        logger.info(
+            f"{prefix}: mode={report.get('mode')} "
+            f"raw_chunk={report.get('original_len')} kept={report.get('kept')} "
+            f"skipped={report.get('skipped')} "
+            f"frames_elapsed={report.get('frames_elapsed')} "
+            f"server_delay_frames={report.get('server_inference_delay_frames')} "
+            f"prefix_frames_used={report.get('prefix_frames_used')} "
+            f"buffer_remaining={rtc.buffer_remaining()} "
+            f"control_step={rtc.control_step}"
+        )
+
+    def _consume_ready_chunk() -> Optional[dict]:
+        nonlocal async_thread, active_infer_started_at, active_infer_seq
+        if not rtc.new_chunk_ready:
+            return None
+        report, _ = rtc.consume_new_chunk()
+        active_infer_started_at = None
+        active_infer_seq = None
+        _log_chunk_report(report)
+        if async_thread is not None:
+            async_thread.join(timeout=1.0)
+            if not async_thread.is_alive():
+                async_thread = None
+        return report
+
+    def _trigger_async_inference(reason: str) -> bool:
+        nonlocal async_thread, active_infer_started_at, active_infer_seq
+        nonlocal last_pending_latency_log_at
+        if not rtc.should_trigger_inference():
+            return False
+        start_meta = rtc.mark_inference_started()
+        if not start_meta:
+            return False
+        active_infer_started_at = float(start_meta["infer_start_time"])
+        active_infer_seq = start_meta.get("infer_seq")
+        last_pending_latency_log_at = active_infer_started_at
+        logger.info(
+            f"RTC inference triggered: reason={reason} control_step={rtc.control_step} "
+            f"trajectory_step={rtc.trajectory_step} "
+            f"task_step={step} buffer_remaining={rtc.buffer_remaining()} "
+            f"frames_since_install={rtc.frames_since_last_chunk_install()}"
+        )
+        async_thread = threading.Thread(
+            target=_rtc_async_infer,
+            args=(rtc, instruction, step, run_id, breakdown, start_meta),
+            daemon=True,
+        )
+        async_thread.start()
+        return True
+
+    def _log_control_frame(frame: dict, mode: str) -> None:
+        inference_logger.log_control_frame(run_id, {
+            **frame,
+            "mode": mode,
+            "step": step,
+            "control_step": rtc.control_step,
+            "trajectory_step": rtc.trajectory_step,
+            "state_names": STATE_NAMES,
+            "units": {"arm_leg_head": "rad", "gripper": "model_0_100",
+                      "sdk_gripper": "m"},
+        })
+
+    def _pop_and_execute_buffered_action():
+        """Atomically consume and dispatch one action relative to observation capture."""
+        with _robot_lock:
+            action = rtc.get_next_action()
+            if action is None:
+                return None, None
+            t_robot = time.perf_counter()
+            executed = robot.execute_action_chunk(
+                [action],
+                dt=dt,
+                skip_interp=not interpolate_actions,
+                # With interpolation enabled this spaces the high-rate SDK
+                # commands across one model period.  The outer monotonic clock
+                # below only sleeps any period time that remains.
+                sleep=interpolate_actions,
+                stop_flag=_stop_event.is_set,
+                frame_logger=lambda frame: _log_control_frame(frame, "policy"),
+            )
+            breakdown.add_robot((time.perf_counter() - t_robot) * 1000)
+            return action, executed
 
     while step < max_steps:
         if _stop_event.is_set():
@@ -913,16 +1146,90 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
             vla.reset()
             break
 
-        action = rtc.get_next_action()
-        if action is None:
-            logger.warning(f"RTC: buffer empty at step {step}, ending")
-            failure_message = "RTC action buffer underflow"
-            break
+        # A result may become ready after the previous frame exhausted the old
+        # tail. Install it before reading the next action so a ready chunk is not
+        # mistaken for a buffer underflow.
+        if rtc.new_chunk_ready:
+            _consume_ready_chunk()
 
-        with _robot_lock:
-            executed = robot.execute_action_chunk(
-                [action], dt=dt, skip_interp=True, sleep=False, stop_flag=_stop_event.is_set
-            )
+        action, executed = _pop_and_execute_buffered_action()
+        if action is None:
+            # The result can race with the empty-buffer check. Consume once more
+            # before entering hold mode, then retry an entirely stale/empty chunk.
+            if rtc.new_chunk_ready:
+                _consume_ready_chunk()
+                action, executed = _pop_and_execute_buffered_action()
+            if action is None:
+                _trigger_async_inference("buffer_empty_retry")
+                hold_action = rtc.last_action()
+                wait_started = time.monotonic()
+                wait_deadline = wait_started + underflow_wait_seconds
+                logger.warning(
+                    f"RTC buffer empty or observation budget reached: control_step={rtc.control_step} task_step={step} "
+                    f"async_running={rtc.infer_in_progress} waited=0ms; "
+                    "holding last target while waiting"
+                )
+                recovered = False
+                while time.monotonic() < wait_deadline and not _stop_event.is_set():
+                    _log_pending_infer_latency()
+                    # Hold cycles count as real control frames. If cooldown was
+                    # the only blocker when the buffer emptied, start the retry
+                    # as soon as the configured interval has genuinely elapsed.
+                    if not rtc.infer_in_progress and not rtc.new_chunk_ready:
+                        _trigger_async_inference("buffer_empty_cooldown_elapsed")
+                    if rtc.new_chunk_ready:
+                        report = _consume_ready_chunk()
+                        if report and report.get("kept", 0) > 0:
+                            recovered = True
+                            break
+                        # Empty or fully stale results are never executed. Retry
+                        # from a fresh observation without issuing duplicates.
+                        _trigger_async_inference("expired_or_empty_chunk_retry")
+
+                    if hold_action is None:
+                        break
+                    hold_cycle_start = time.perf_counter()
+                    with _robot_lock:
+                        t_robot = time.perf_counter()
+                        held = robot.execute_action_chunk(
+                            [hold_action],
+                            dt=dt,
+                            skip_interp=not interpolate_actions,
+                            sleep=interpolate_actions,
+                            stop_flag=_stop_event.is_set,
+                            frame_logger=lambda frame: _log_control_frame(frame, "hold"),
+                        )
+                        breakdown.add_robot((time.perf_counter() - t_robot) * 1000)
+                    if not held:
+                        failure_message = "Robot rejected RTC underflow hold target"
+                        break
+                    rtc.record_hold_frame()
+                    hold_remaining = period - (time.perf_counter() - hold_cycle_start)
+                    if hold_remaining > 0:
+                        rtc.wait_for_new_chunk(min(hold_remaining, max(
+                            0.0, wait_deadline - time.monotonic()
+                        )))
+
+                if failure_message:
+                    break
+                if rtc.new_chunk_ready:
+                    report = _consume_ready_chunk()
+                    recovered = recovered or bool(report and report.get("kept", 0) > 0)
+                waited_ms = (time.monotonic() - wait_started) * 1000
+                if recovered and rtc.buffer_remaining() > 0:
+                    logger.warning(
+                        f"RTC recovered from underflow after {waited_ms:.0f} ms: "
+                        f"control_step={rtc.control_step} buffer={rtc.buffer_remaining()}"
+                    )
+                    next_t = time.perf_counter()
+                    continue
+                logger.error(
+                    f"RTC underflow timeout after {waited_ms:.0f} ms: "
+                    f"control_step={rtc.control_step} async_running={rtc.infer_in_progress}"
+                )
+                failure_message = "RTC action buffer underflow timeout"
+                break
+
         if not executed:
             logger.error(f"RTC: action execution failed at step {step}; stopping")
             failure_message = f"Robot rejected VLA action at RTC step {step}"
@@ -930,32 +1237,13 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
             break
 
         logger.info(f"RTC step {step}: buffer_remaining={rtc.buffer_remaining()}")
+        _log_pending_infer_latency()
         step += 1
 
-        if rtc.should_trigger_inference():
-            logger.info(
-                f"RTC: triggering async inference at step {step} "
-                f"(remaining={rtc.buffer_remaining()})"
-            )
-            rtc.mark_inference_started()
-            async_thread = threading.Thread(
-                target=_rtc_async_infer,
-                args=(rtc, instruction, step, run_id),
-                daemon=True,
-            )
-            async_thread.start()
-
-        if rtc.new_chunk_ready:
-            report, _ = rtc.consume_new_chunk()
-            logger.info(
-                f"RTC: fused new chunk at step {step}, buffer={rtc.buffer_remaining()} "
-                f"mode={(report or {}).get('mode')} skipped={(report or {}).get('skipped')} "
-                f"start_index={(report or {}).get('start_index')} "
-                f"frames_elapsed={(report or {}).get('frames_elapsed')}"
-            )
-            if async_thread is not None:
-                async_thread.join(timeout=1.0)
-                async_thread = None
+        # A ready result blocks should_trigger_inference(), so a completion
+        # racing with this check is consumed at the top of the next iteration
+        # before another inference can overwrite its start pointer.
+        _trigger_async_inference("threshold")
 
         next_t += period
         remaining = next_t - time.perf_counter()
@@ -965,11 +1253,18 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
             # Late: do not skip actions to catch up (would accelerate playback).
             next_t = time.perf_counter()
 
-    # A failed SDK command may coincide with a background request. Give that
-    # daemon a short chance to leave the shared robot/VLA path before returning
-    # failure to the behaviour tree.
+    control_loop_wall_ms = (time.perf_counter() - control_loop_started_at) * 1000
+
+    # Invalidate this generation before returning. An uncancellable RPC may
+    # finish naturally, but its callback can no longer publish into this RTC.
+    rtc.close_session()
     if async_thread is not None and async_thread.is_alive():
         async_thread.join(timeout=1.0)
+        if async_thread.is_alive():
+            logger.warning(
+                "RTC session closed with an inference RPC still in flight; "
+                "its eventual result will be discarded"
+            )
 
     inference_logger.end_run(run_id)
 
@@ -981,36 +1276,169 @@ def _run_vla_rtc(instruction: str, max_steps: int, rtc_cfg: dict) -> dict:
             "steps": step,
             "total_actions_executed": step,
             "max_steps": max_steps,
+            "execution_mode": "rtc",
+            "rtc_initial_phase_ms": first_infer_ms,
+            "rtc_control_loop_wall_ms": control_loop_wall_ms,
+            "timing_breakdown": breakdown.as_dict(),
         },
     }
 
 
-def _rtc_async_infer(rtc, instruction, current_step, run_id):
+def _rtc_async_infer(rtc, instruction, current_step, run_id, breakdown=None,
+                     start_meta=None):
     """后台线程：获取观测 → VLA 推理 → 返回结果。"""
+    start_meta = dict(start_meta or {})
+    session_id = start_meta.get("session_id", rtc.session_id)
     try:
+        if not rtc.is_session_active(session_id):
+            return
         t0 = time.perf_counter()
         with _robot_lock:
             obs, meta = _capture_and_preprocess()
+            capture_meta = rtc.mark_observation_captured(session_id)
+        if capture_meta is None:
+            logger.info("RTC async: session ended during observation capture; discarding")
+            return
+        async_meta = {**start_meta, **capture_meta}
         if obs is None:
             logger.error("RTC async: observation is None, skip infer")
-            rtc.mark_inference_done([])
+            rtc.mark_inference_done([], async_meta, session_id=session_id)
             return
         obs_elapsed_ms = (time.perf_counter() - t0) * 1000
+        if breakdown is not None:
+            breakdown.add_obs(obs_elapsed_ms)
         obs["task"] = instruction
         if not validate_observation(obs):
             logger.error("RTC async: observation schema invalid, skip infer")
-            rtc.mark_inference_done([])
+            rtc.mark_inference_done([], async_meta, session_id=session_id)
             return
+        captured_grippers = {
+            str(index): float(obs[STATE_NAMES[index]])
+            for index in GRIPPER_INDICES
+            if index < len(STATE_NAMES) and STATE_NAMES[index] in obs
+        }
+        if captured_grippers:
+            async_meta["obs_capture_grippers"] = captured_grippers
 
         inference_logger.log_obs(run_id=run_id, step=current_step, obs=obs, elapsed_ms=obs_elapsed_ms)
 
         t_infer = time.perf_counter()
-        actions = vla.infer(obs, instruction, timestep=current_step)
+        async_meta["infer_start_step"] = rtc.control_step
+        async_meta["infer_start_control_step"] = rtc.control_step
+        async_meta["infer_start_trajectory_step"] = rtc.trajectory_step
+        async_meta["infer_start_time"] = time.monotonic()
+        request_fps = float(
+            (ROBOT_CFG.get("control") or {}).get("fps", CFG.get("fps", 30)) or 30
+        )
+        rtc_request = {
+            "trace_id": (
+                f"{session_id}:{async_meta.get('infer_seq', 0)}:"
+                f"{async_meta.get('obs_capture_trajectory_step', current_step)}"
+            ),
+            "previous_actions": async_meta.get("previous_actions", []),
+            "previous_action_start_index": async_meta.get(
+                "previous_action_start_index", 0
+            ),
+            "control_step": async_meta.get("obs_capture_control_step", 0),
+            "trajectory_step": async_meta.get("obs_capture_trajectory_step", current_step),
+            "fps": request_fps,
+        }
+        actions = vla.infer(
+            obs,
+            instruction,
+            timestep=current_step,
+            rtc_context=rtc_request,
+        )
         infer_elapsed_ms = (time.perf_counter() - t_infer) * 1000
+        async_meta["infer_return_time"] = time.monotonic()
+        async_meta["infer_return_step"] = rtc.control_step
+        async_meta["infer_return_control_step"] = rtc.control_step
+        async_meta["infer_return_trajectory_step"] = rtc.trajectory_step
+        async_meta["inference_latency_ms"] = infer_elapsed_ms
+        rpc_timing = {}
+        if breakdown is not None:
+            rpc_timing = breakdown.add_infer(vla) or {}
+        else:
+            take_timing = getattr(vla, "take_last_infer_timing", None)
+            if callable(take_timing):
+                rpc_timing = take_timing() or {}
+
+        pack_ms = float(rpc_timing.get("pack_ms") or 0.0)
+        client_wait_ms = float(rpc_timing.get("client_wait_ms") or 0.0)
+        serialize_ms = float(rpc_timing.get("serialize_ms") or 0.0)
+        observation_rpc_ms = float(
+            rpc_timing.get("send_rpc_ms") or rpc_timing.get("send_ms") or 0.0
+        )
+        client_dispatch_ms = float(rpc_timing.get("client_dispatch_ms") or 0.0)
+        request_iterator_ms = float(rpc_timing.get("request_iterator_ms") or 0.0)
+        send_ack_wait_ms = float(rpc_timing.get("send_ack_wait_ms") or 0.0)
+        response_wait_ms = float(
+            rpc_timing.get("get_actions_rpc_ms") or rpc_timing.get("wait_ms") or 0.0
+        )
+        response_decode_ms = float(rpc_timing.get("response_decode_ms") or 0.0)
+        rpc_total_ms = float(
+            rpc_timing.get("rpc_total_ms") or rpc_timing.get("total_ms") or infer_elapsed_ms
+        )
+        payload_mib = float(rpc_timing.get("payload_bytes") or 0) / 1024.0 / 1024.0
+        baseline_rtt_ms = float(getattr(breakdown, "rtt_ms", 0.0) or 0.0)
+        trace_id = str(rpc_timing.get("trace_id") or "?")
+        server_timing = dict(rpc_timing.get("server_timing") or {})
+        response_meta = dict(rpc_timing.get("response_meta") or {})
+        async_meta["inference_delay_frames"] = int(
+            response_meta.get("inference_delay_frames", 0) or 0
+        )
+        async_meta["prefix_frames_used"] = int(
+            response_meta.get("prefix_frames_used", 0) or 0
+        )
+        async_meta["expired_prefix_frames"] = int(
+            response_meta.get("expired_prefix_frames", 0) or 0
+        )
+
+        def _timing_text(name: str) -> str:
+            value = server_timing.get(name)
+            return "?" if value is None else f"{float(value):.0f}ms"
+
+        server_total = server_timing.get("server_get_actions_ms")
+        get_actions_transport_ms = None
+        if server_total is not None:
+            get_actions_transport_ms = max(0.0, response_wait_ms - float(server_total))
+        logger.info(
+            f"RTC latency: status=done infer_seq={async_meta.get('infer_seq')} "
+            f"task_step={current_step} obs_ms={obs_elapsed_ms:.0f} "
+            f"pack_ms={pack_ms:.0f} observation_rpc_ms={observation_rpc_ms:.0f} "
+            f"response_wait_ms={response_wait_ms:.0f} rpc_total_ms={rpc_total_ms:.0f} "
+            f"baseline_rtt_ms={baseline_rtt_ms:.0f} payload_mib={payload_mib:.2f} "
+            f"actions={len(actions) if actions else 0} "
+            f"prefix_frames_used={async_meta['prefix_frames_used']} "
+            f"inference_delay_frames={async_meta['inference_delay_frames']} "
+            f"control_elapsed={rtc.control_step - int(async_meta['obs_capture_control_step'])} "
+            f"trajectory_elapsed={rtc.trajectory_step - int(async_meta['obs_capture_trajectory_step'])} "
+            f"buffer_remaining={rtc.buffer_remaining()}"
+        )
+        logger.info(
+            f"RTC DETAIL: trace_id={trace_id} obs={obs_elapsed_ms:.0f}ms "
+            f"pack={pack_ms:.0f}ms client_wait={client_wait_ms:.0f}ms "
+            f"serialize={serialize_ms:.0f}ms observation_rpc={observation_rpc_ms:.0f}ms "
+            f"client_dispatch={client_dispatch_ms:.0f}ms "
+            f"request_iterator={request_iterator_ms:.0f}ms "
+            f"server_ack_wait={send_ack_wait_ms:.0f}ms "
+            f"server_receive={_timing_text('server_receive_ms')} "
+            f"server_queue={_timing_text('server_queue_ms')} "
+            f"server_preprocess={_timing_text('server_preprocess_ms')} "
+            f"model_infer={_timing_text('server_model_infer_ms')} "
+            f"server_postprocess={_timing_text('server_postprocess_ms')} "
+            f"server_serialize={_timing_text('server_serialize_ms')} "
+            f"get_actions_rpc={response_wait_ms:.0f}ms "
+            f"get_actions_transport="
+            f"{'?' if get_actions_transport_ms is None else f'{get_actions_transport_ms:.0f}ms'} "
+            f"response_decode={response_decode_ms:.0f}ms rpc_total={rpc_total_ms:.0f}ms"
+        )
 
         if _stop_event.is_set():
             logger.info("RTC async: stop requested while inferring; discarding stale chunk")
-            rtc.mark_inference_done([])
+            return
+        if not rtc.is_session_active(session_id):
+            logger.info("RTC async: stale session result discarded")
             return
 
         if actions:
@@ -1019,17 +1447,26 @@ def _rtc_async_infer(rtc, instruction, current_step, run_id):
                 run_id, instruction, current_step, obs, actions, infer_elapsed_ms,
                 selected_action_count=len(action_vectors),
             )
-            rtc.mark_inference_done(action_vectors)
+            published = rtc.mark_inference_done(
+                action_vectors, async_meta, session_id=session_id
+            )
+            if not published:
+                logger.info("RTC async: result arrived after session close; discarded")
+                return
             logger.info(
-                f"RTC async infer done: obs={obs_elapsed_ms:.0f}ms, infer={infer_elapsed_ms:.0f}ms, "
-                f"actions={len(action_vectors)}"
+                f"RTC async infer done: obs_control_step={async_meta.get('obs_capture_control_step')} "
+                f"obs_trajectory_step={async_meta.get('obs_capture_trajectory_step')} "
+                f"infer_start_step={async_meta.get('infer_start_step')} "
+                f"return_step={async_meta.get('infer_return_step')} "
+                f"obs={obs_elapsed_ms:.0f}ms, "
+                f"infer={infer_elapsed_ms:.0f}ms, actions={len(action_vectors)}"
             )
         else:
             logger.warning("RTC async inference returned no actions")
-            rtc.mark_inference_done([])
+            rtc.mark_inference_done([], async_meta, session_id=session_id)
     except Exception as e:
         logger.error(f"RTC async inference error: {e}")
-        rtc.mark_inference_done([])
+        rtc.mark_inference_done([], start_meta, session_id=session_id)
 
 
 # ------------------------------------------------------------------

@@ -115,6 +115,18 @@ class VLAInferenceLogger:
                 "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             })
 
+    def log_control_frame(self, run_id: str, frame: dict):
+        """记录动作下发诊断；actual_state 是下发前反馈，不是到位反馈。"""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._write({
+                **frame,
+                "event": "control_frame",
+                "run_id": run_id,
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            })
+
     def log_camera_geometry(self, run_id: str, geometry: dict):
         """Persist native HxW vs 224 letterbox for the first observation of a run."""
         if not self.enabled or not geometry:

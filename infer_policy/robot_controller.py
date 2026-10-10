@@ -914,24 +914,167 @@ class RobotController:
                 time.sleep(1.0)
         return False
 
-    def set_init_pose(self, timeout: float = 8.0, retries: int = 2) -> bool:
-        """Set and read back the configured training initial pose."""
+    def set_arm_pose_smooth(
+        self,
+        positions_map: dict,
+        duration_seconds: float = 3.0,
+        control_hz: float = 100.0,
+        settle_seconds: float = 0.2,
+        retries: int = 2,
+        joint_tolerance_rad: float = 0.03,
+    ) -> bool:
+        """Move both arms with a minimum-jerk trajectory, without commanding grippers."""
+        if self.robot is None or JointCommand is None:
+            return False
+        if set(positions_map) != {"right_arm", "left_arm"}:
+            logger.error("Smooth arm pose must contain only right_arm and left_arm")
+            return False
+
+        try:
+            targets = {
+                name: np.asarray(positions_map[name], dtype=np.float32).reshape(-1)
+                for name in ("right_arm", "left_arm")
+            }
+        except (TypeError, ValueError) as exc:
+            logger.error(f"Invalid smooth arm pose: {exc}")
+            return False
+        if any(values.size != 7 or not np.all(np.isfinite(values)) for values in targets.values()):
+            logger.error("Smooth arm pose requires 7 finite joints for each arm")
+            return False
+
+        duration_seconds = float(duration_seconds)
+        control_hz = float(control_hz)
+        settle_seconds = float(settle_seconds)
+        joint_tolerance_rad = float(joint_tolerance_rad)
+        if duration_seconds <= 0 or control_hz <= 0 or settle_seconds < 0 or joint_tolerance_rad <= 0:
+            logger.error("Invalid smooth arm pose timing or tolerance")
+            return False
+
+        steps = max(2, int(math.ceil(duration_seconds * control_hz)))
+        period = duration_seconds / steps
+        retries = max(1, int(retries))
+
+        for attempt in range(1, retries + 1):
+            state = self.get_joint_state()
+            if state is None:
+                logger.error("Cannot restore arms smoothly: joint state unavailable")
+                return False
+            state = np.asarray(state, dtype=np.float32).reshape(-1)
+            if state.size != 23 or not np.all(np.isfinite(state)):
+                logger.error(f"Cannot restore arms smoothly: invalid state shape={state.shape}")
+                return False
+
+            starts = {
+                "right_arm": state[0:7].copy(),
+                "left_arm": state[8:15].copy(),
+            }
+            started_at = time.perf_counter()
+            command_ok = True
+            for step in range(1, steps + 1):
+                phase = step / steps
+                # Quintic minimum-jerk blend: zero velocity and acceleration at both ends.
+                blend = 10.0 * phase**3 - 15.0 * phase**4 + 6.0 * phase**5
+                waypoint = {
+                    name: starts[name] + (targets[name] - starts[name]) * blend
+                    for name in ("right_arm", "left_arm")
+                }
+                if not self._send_joint_group_positions(waypoint):
+                    command_ok = False
+                    logger.error(
+                        f"set_arm_pose_smooth command failed at step {step}/{steps}"
+                    )
+                    break
+                remaining = started_at + step * period - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
+
+            if command_ok:
+                if settle_seconds > 0:
+                    time.sleep(settle_seconds)
+                measured = self.get_joint_state()
+                if measured is not None:
+                    measured = np.asarray(measured, dtype=np.float32).reshape(-1)
+                if measured is not None and measured.size == 23:
+                    errors = {
+                        "right_arm": float(np.max(np.abs(measured[0:7] - targets["right_arm"]))),
+                        "left_arm": float(np.max(np.abs(measured[8:15] - targets["left_arm"]))),
+                    }
+                    arrived = all(error <= joint_tolerance_rad for error in errors.values())
+                    self.last_arm_pose_verification = {
+                        "success": arrived,
+                        "max_abs_error_rad": errors,
+                        "tolerance_rad": joint_tolerance_rad,
+                    }
+                    logger.info(
+                        f"set_arm_pose_smooth attempt={attempt}/{retries} "
+                        f"duration={time.perf_counter() - started_at:.2f}s verification="
+                        f"{self.last_arm_pose_verification}"
+                    )
+                    if arrived:
+                        return True
+                else:
+                    logger.error("Smooth arm pose verification failed: joint state unavailable")
+            if attempt < retries:
+                time.sleep(0.2)
+        return False
+
+    def set_init_pose(
+        self, timeout: Optional[float] = None, retries: Optional[int] = None,
+    ) -> bool:
+        """Set the training pose and return as soon as feedback is stably in tolerance."""
         init_cfg = self.cfg.get("init_joint_positions")
         if not init_cfg:
             logger.info("No init_joint_positions configured")
             return True  # not an error
-        for attempt in range(1, max(1, retries) + 1):
+        restore_cfg = self.cfg.get("init_pose_restore") or {}
+        timeout = float(
+            restore_cfg.get("timeout_seconds", 8.0) if timeout is None else timeout
+        )
+        retries = max(1, int(
+            restore_cfg.get("retries", 2) if retries is None else retries
+        ))
+        poll_interval = max(0.01, float(restore_cfg.get("poll_interval_seconds", 0.1)))
+        stable_samples = max(1, int(restore_cfg.get("stable_samples", 2)))
+        retry_delay = max(0.0, float(restore_cfg.get("retry_delay_seconds", 0.2)))
+        if timeout <= 0:
+            logger.error("init_pose_restore.timeout_seconds must be > 0")
+            return False
+
+        for attempt in range(1, retries + 1):
             sent = self._send_joint_group_positions(init_cfg)
             logger.info(f"set_init_pose attempt={attempt}/{retries} command_ok={sent}")
             if sent:
-                time.sleep(timeout)
-                if self.verify_init_pose(init_cfg):
-                    return True
+                deadline = time.perf_counter() + timeout
+                consecutive_ok = 0
+                while True:
+                    if self.verify_init_pose(init_cfg, log_result=False):
+                        consecutive_ok += 1
+                        if consecutive_ok >= stable_samples:
+                            ignored = self.last_init_pose_verification.get("ignored_failures", [])
+                            if ignored:
+                                logger.warning(f"Initial pose continuing with ignored tolerance failures: {ignored}")
+                            logger.info(
+                                f"Initial pose reached on attempt={attempt}/{retries}: "
+                                f"{self.last_init_pose_verification}"
+                            )
+                            return True
+                    else:
+                        consecutive_ok = 0
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(poll_interval, remaining))
+                logger.error(
+                    f"Initial pose timed out after {timeout:.2f}s on "
+                    f"attempt={attempt}/{retries}: {self.last_init_pose_verification}"
+                )
             if attempt < retries:
-                time.sleep(1.0)
+                time.sleep(retry_delay)
         return False
 
-    def verify_init_pose(self, positions_map: Optional[dict] = None) -> bool:
+    def verify_init_pose(
+        self, positions_map: Optional[dict] = None, log_result: bool = True,
+    ) -> bool:
         """Verify training-pose arrival against fresh 23-D SDK feedback."""
         positions_map = positions_map or self.cfg.get("init_joint_positions") or {}
         state = self.get_joint_state()
@@ -945,7 +1088,8 @@ class RobotController:
         verify_cfg = self.cfg.get("init_pose_verify") or {}
         joint_tolerance = float(verify_cfg.get("joint_tolerance_rad", 0.03))
         gripper_tolerance = float(verify_cfg.get("gripper_tolerance_model", 3.0))
-        result = {"success": True, "groups": {}}
+        warning_only = set(verify_cfg.get("warning_only_groups") or [])
+        result = {"success": True, "groups": {}, "ignored_failures": []}
 
         for name, values in positions_map.items():
             group = groups.get(name)
@@ -977,9 +1121,14 @@ class RobotController:
             measured = state[indices]
             errors = np.abs(measured - target)
             group_ok = bool(np.all(errors <= tolerance))
-            result["success"] = bool(result["success"] and group_ok)
+            ignored = (not group_ok and name in warning_only
+                       and bool(np.isfinite(measured).all()))
+            if ignored:
+                result["ignored_failures"].append(name)
+            result["success"] = bool(result["success"] and (group_ok or ignored))
             result["groups"][name] = {
                 "success": group_ok,
+                "warning_only": ignored,
                 "max_abs_error": float(np.max(errors)),
                 "tolerance": tolerance,
                 "unit": unit,
@@ -988,8 +1137,9 @@ class RobotController:
             }
 
         self.last_init_pose_verification = result
-        log = logger.info if result["success"] else logger.error
-        log(f"Initial pose read-back verification: {result}")
+        if log_result:
+            log = (logger.warning if result["ignored_failures"] else logger.info) if result["success"] else logger.error
+            log(f"Initial pose read-back verification: {result}")
         return bool(result["success"])
 
     def training_start_gripper_positions(self) -> dict:
@@ -1023,6 +1173,26 @@ class RobotController:
         )
         return self._set_pose_with_retry(
             gripper_map, timeout, retries, "set_training_start_grippers"
+        )
+
+    def open_grippers(self, settle_seconds: float = 2.0, retries: int = 2) -> bool:
+        """Fully open both grippers without moving any arm or body joint."""
+        recovery_cfg = self.cfg.get("recovery", {})
+        open_width = float(
+            recovery_cfg.get("gripper_open_width", self._gripper_max_width())
+        )
+        positions = {
+            "right_gripper": [open_width],
+            "left_gripper": [open_width],
+        }
+        logger.info(
+            f"Opening both grippers after only-pick completion: {open_width:.3f} m"
+        )
+        return self._set_pose_with_retry(
+            positions,
+            max(0.0, float(settle_seconds)),
+            max(1, int(retries)),
+            "open_grippers",
         )
 
     def set_recovery_pose(self) -> bool:
@@ -1064,7 +1234,7 @@ class RobotController:
     # ------------------------------------------------------------------
 
     def _build_execute_group_spec(self):
-        """Build joint_groups + model→cmd index mapping from vla_config.yaml.
+        """Build joint_groups + model→cmd index mapping from config.yaml.
 
         读取 ``robot.joint_groups``，格式与 replay_config.yaml 一致:
             [{name, indices, is_gripper?, enabled?}, ...]
@@ -1114,9 +1284,9 @@ class RobotController:
     def _expand_model_action(self, action: Sequence[float], current_state: np.ndarray) -> np.ndarray:
         """Expand the configured model action prefix to the full 23-D robot state.
 
-        The new pick policy predicts a 16-D arms/grippers prefix, while the
-        legacy place policy predicts all 23 dimensions. Missing dimensions are
-        copied from the latest measured state.
+        The configured policy predicts a fixed-size arms/grippers prefix.
+        Missing robot-state dimensions are copied from the latest measured
+        state only after the policy action has passed the strict schema check.
         """
         full_dim = 23
         model_dim = int(self.cfg.get("vla_action_dim", full_dim))
@@ -1125,15 +1295,15 @@ class RobotController:
 
         action_arr = np.asarray(action, dtype=np.float32)
         state_arr = np.asarray(current_state, dtype=np.float32).reshape(-1)
-        if action_arr.ndim != 1 or action_arr.size not in (model_dim, full_dim):
+        if action_arr.ndim != 1 or action_arr.size != model_dim:
             raise ValueError(
                 f"action dim mismatch: got shape={action_arr.shape}, "
-                f"expected {model_dim} or {full_dim}"
+                f"expected exactly {model_dim}"
             )
         if state_arr.size != full_dim:
             raise ValueError(f"current state dim mismatch: got {state_arr.size}, expected {full_dim}")
 
-        if action_arr.size == full_dim:
+        if model_dim == full_dim:
             return action_arr.copy()
         expanded = state_arr.copy()
         expanded[:model_dim] = action_arr
@@ -1142,7 +1312,8 @@ class RobotController:
     def execute_action_chunk(self, actions: List[List[float]], dt: float, max_delta: float = 0.3,
                               skip_interp: bool = False,
                               sleep: bool = True,
-                              stop_flag: Optional[Callable[[], bool]] = None):
+                              stop_flag: Optional[Callable[[], bool]] = None,
+                              frame_logger: Optional[Callable[[dict], None]] = None):
         """Execute configured model actions via 23-D set_joint_commands.
 
         Full order: right_arm(7) + right_gripper(1) + left_arm(7) +
@@ -1157,7 +1328,7 @@ class RobotController:
           2) 插值升频 (30→250Hz) → 逐帧下发 SDK
 
         Args:
-            skip_interp: 如果为 True，跳过插值阶段，每帧直接下发 (RTC 模式用)。
+            skip_interp: 如果为 True，跳过插值阶段，每帧直接下发。
         """
         if self.robot is None or JointCommand is None:
             return False
@@ -1190,6 +1361,8 @@ class RobotController:
             )
             return False
         interpolation_start = current_pos.copy()
+        actual_state_perf = time.perf_counter()
+        frame_diagnostics = []
 
         # ================================================================
         # Phase 1: Compute per-action safe targets
@@ -1214,12 +1387,39 @@ class RobotController:
                 else:
                     clipped_delta[j] = np.clip(delta[j], -arm_max_delta, arm_max_delta)
             safe_action = current_pos + clipped_delta
+            delta_limited_action = safe_action.copy()
 
             # Absolute joint limits
             safe_action = self._clip_to_joint_limits(safe_action)
+            joint_limited_action = safe_action.copy()
 
             # Action smoothing filter
             safe_action = self.action_filter(safe_action)
+
+            if frame_logger is not None:
+                frame_diagnostics.append({
+                    "model_action": action_arr.tolist(),
+                    "safe_action": safe_action.tolist(),
+                    "actual_state": interpolation_start.tolist(),
+                    "actual_state_perf": actual_state_perf,
+                    "actual_state_phase": "before_chunk_dispatch",
+                    "clip": {
+                        "reference_state": current_pos.tolist(),
+                        "requested_delta": delta.tolist(),
+                        "limited_delta": clipped_delta.tolist(),
+                        "delta_clipped_indices": np.flatnonzero(
+                            np.abs(delta - clipped_delta) > 1e-6
+                        ).tolist(),
+                        "joint_limit_clipped_indices": np.flatnonzero(
+                            np.abs(delta_limited_action - joint_limited_action) > 1e-6
+                        ).tolist(),
+                        "filter_changed_indices": np.flatnonzero(
+                            np.abs(joint_limited_action - safe_action) > 1e-6
+                        ).tolist(),
+                        "arm_delta_limit_rad": arm_max_delta,
+                        "gripper_delta_limit_model": gripper_max_delta,
+                    },
+                })
 
             safe_actions.append(safe_action)
             current_pos = safe_action
@@ -1245,7 +1445,15 @@ class RobotController:
                 f"Interpolation: current+{len(safe_actions)} targets→{len(interp_actions)} frames, "
                 f"{elapsed_interp_ms:.2f}ms"
             )
-            send_dt = 1.0 / float(interp_cfg.get("output_hz", 250))
+            # The interpolation grid always includes both endpoints.  Spread
+            # its M commands over exactly the low-rate trajectory duration,
+            # rather than sleeping 1/output_hz after all M commands (which
+            # makes a one-action RTC period too long and sleeps after the final
+            # endpoint unnecessarily).
+            trajectory_s = len(safe_actions) * float(
+                getattr(self.interpolator, "input_dt", dt)
+            )
+            send_dt = trajectory_s / max(len(interp_actions) - 1, 1)
         else:
             interp_actions = [np.asarray(a, dtype=np.float32) for a in safe_actions]
             send_dt = dt
@@ -1288,6 +1496,9 @@ class RobotController:
                 )
 
             time_from_start = self._set_joint_time_from_start()
+            dispatch_perf = time.perf_counter()
+            status = None
+            dispatch_error = None
             try:
                 status = self.robot.set_joint_commands(
                     joint_commands,
@@ -1305,11 +1516,31 @@ class RobotController:
                         )
                         break
             except Exception as e:
+                dispatch_error = str(e)
                 logger.error(f"set_joint_commands error at interp step {i}: {e}")
                 command_failed = True
                 break
+            finally:
+                # RTC 每次下发一个非插值目标；不把插值帧误标成模型帧。
+                if frame_logger is not None and not interp_enabled:
+                    try:
+                        frame_logger({
+                            **frame_diagnostics[i],
+                            "action_index_in_call": i,
+                            "dispatch_perf": dispatch_perf,
+                            "dispatch_end_perf": time.perf_counter(),
+                            "sdk_success": status == gm.ControlStatus.SUCCESS,
+                            "sdk_status": str(status),
+                            "sdk_error": dispatch_error,
+                            "sdk_target_positions": [float(c.position) for c in joint_commands],
+                            "model_to_sdk_index": list(model_to_cmd),
+                            "gripper_action_scale": gripper_action_scale,
+                            "time_from_start": time_from_start,
+                        })
+                    except Exception as exc:
+                        logger.warning(f"逐帧诊断日志写入失败: {exc}")
 
-            if sleep and send_dt > 0:
+            if sleep and send_dt > 0 and i + 1 < len(interp_actions):
                 time.sleep(send_dt)
 
         return not command_failed

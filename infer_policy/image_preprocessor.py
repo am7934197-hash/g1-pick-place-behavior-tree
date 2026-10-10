@@ -13,6 +13,7 @@ from emulate_data_collection import emulate_fov, parse_camera_specs
 
 
 TRAINING_IMAGE_HW = (480, 640)  # H, W; 4:3 source used to build the 224 videos
+WRIST_CAMERA_KEYS = frozenset(("left_arm", "right_arm"))
 
 
 def letterbox_content_size(
@@ -42,9 +43,10 @@ def crop_to_training_aspect(
 ) -> np.ndarray:
     """Center-crop to the training 4:3 aspect. Does not stretch.
 
-    Wrist cameras on this robot are 720×1280 (16:9). Training videos are
-    480×640 (4:3). Cropping 1280→960 keeps height 720, then letterbox
-    produces the same 168×224 content + 28px bars as 480×640.
+    Legacy wrist-camera frames can be 720×1280 (16:9), while training videos
+    are 480×640 (4:3). Cropping 1280→960 keeps height 720, then letterbox
+    produces the same 168×224 content + 28px bars as 480×640. Current wrist
+    frames already arrive as 480×640 and therefore pass through unchanged.
     """
     h, w = img.shape[:2]
     if h <= 0 or w <= 0 or native_matches_training_aspect(h, w, training_hw, rtol):
@@ -170,7 +172,12 @@ class ImagePreprocessor:
             if isinstance(v, np.ndarray) and v.ndim == 3:
                 img = v
                 spec = self._emulate_specs.get(k) if self._emulate_dc else None
-                if spec:
+                # Both wrist streams now arrive in the same 480x640 geometry as
+                # the training data. Do not run the legacy working-mode FOV
+                # emulation on those ready frames; only letterbox them to the
+                # model input size below.
+                wrist_ready = k in WRIST_CAMERA_KEYS and img.shape[:2] == self._training_hw
+                if spec and not wrist_ready:
                     if spec.get("crop_to_training_aspect"):
                         img = crop_to_training_aspect(img, self._training_hw)
                     img = emulate_fov(
