@@ -1,0 +1,31 @@
+camera_name = "stereo_camera"
+camera_type = "senyun"
+color_width = 640
+color_height = 480
+depth_width = 1280
+depth_height = 960
+encoding = "jpeg"
+jpeg_qua = 95
+frame_rate = 30
+auto_exposure = 1
+compress_enabled=false
+compression_level=90
+use_hwencode = "true"
+undistort_enabled = "true"
+brightness = 0
+server_ip = "192.168.1.50"
+
+## 0 default,1 :corped then remaper, 2:rectify
+undistort_type= 1
+##for corped then remaper only
+zoom_factor=3.0
+
+
+#rectify config
+stretch_enabled="false"
+
+
+##raw data config
+enabled_raw_image_publish = "false"
+
+

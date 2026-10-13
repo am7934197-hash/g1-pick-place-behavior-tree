@@ -1,0 +1,2 @@
+# Runtime inference dependencies are shared with this task's reference server.
+-r ../infer_policy/requirements.txt

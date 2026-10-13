@@ -1,0 +1,21 @@
+camera_name = "left_arm_camera"
+camera_type = "RealSense_D405"
+
+color_width = 640
+color_height = 480
+depth_width = 640
+depth_height = 480
+encoding = "jpeg"
+jpeg_qua = 60
+frame_rate = 30
+auto_exposure = 1
+brightness = 0
+server_ip = "192.168.1.50"
+
+ir_enabled = true
+ir_width = 640
+ir_height = 480
+
+
+##raw data config
+enabled_raw_image_publish = "false"

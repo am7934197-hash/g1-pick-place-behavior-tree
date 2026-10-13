@@ -1,0 +1,160 @@
+# 原地执行 pick：每个推理 chunk 只执行前 N 帧后立刻再采图推理。
+max_steps: 400
+execute: true
+execute_actions_per_chunk: 20
+
+robot:
+  sensor_set: [HEAD_RIGHT_CAMERA, LEFT_ARM_CAMERA, RIGHT_ARM_CAMERA]
+  sensor_warmup_seconds: 10.0
+  camera_retries: 5
+  camera_retry_delay: 0.2
+  # 与 behavior_tree/alignment_schema.py 的 23 维状态顺序一致。
+  joint_groups: [right_arm, right_gripper, left_arm, left_gripper, leg, head]
+  gripper_max_width: 0.12
+  gripper_velocity: 0.15
+  gripper_effort: 10.0
+  set_joint_time_from_start: 0.0
+  state_feature_names:
+    - right_arm_joint1
+    - right_arm_joint2
+    - right_arm_joint3
+    - right_arm_joint4
+    - right_arm_joint5
+    - right_arm_joint6
+    - right_arm_joint7
+    - right_arm_gripper
+    - left_arm_joint1
+    - left_arm_joint2
+    - left_arm_joint3
+    - left_arm_joint4
+    - left_arm_joint5
+    - left_arm_joint6
+    - left_arm_joint7
+    - left_arm_gripper
+    - leg_joint1
+    - leg_joint2
+    - leg_joint3
+    - leg_joint4
+    - leg_joint5
+    - head_joint1
+    - head_joint2
+
+  # 来源：g1_pick_place/behavior_tree2/behavior_tree/config.yaml
+  init_joint_positions:
+    right_arm: [-1.148423, 0.602304, 0.744699, 1.483263, 0.355501, -0.218664, -1.418644]
+    right_gripper: [0.0]
+    left_arm: [0.761190, -0.624880, -0.110855, -1.601858, -0.269837, 0.051077, 1.184783]
+    left_gripper: [0.0]
+    leg: [0.576957, 1.461440, 0.926045, 0.040099, 0.000959]
+    head: [-0.074961, 0.429958]
+  init_pose_restore:
+    timeout_seconds: 8.0
+    poll_interval_seconds: 0.1
+    stable_samples: 2
+    retry_delay_seconds: 0.2
+    retries: 2
+  init_pose_verify:
+    joint_tolerance_rad: 0.03
+    gripper_tolerance_model: 3.0
+
+  # pick 模型只预测双臂+夹爪 16 维；腿和头保持当前实测值，不随模型动。
+  vla_action_dim: 16
+  control:
+    fps: 30
+    interpolation:
+      enabled: true
+      method: linear
+      input_hz: 30
+      output_hz: 250
+    max_joint_delta_per_step: 0.05
+    gripper_max_delta_per_step: 20.0
+    gripper_action_scale: 0.0012
+    joint_limits:
+      - [-1.83, 0.11]
+      - [0.29, 1.6081]
+      - [-0.84, 1.17]
+      - [1.178, 2.47]
+      - [-0.76, 1.04]
+      - [-0.7354, 0.8227]
+      - [-1.5382, 0.61]
+      - [0, 100]
+      - [0.0, 1.45]
+      - [-1.6081, -0.27]
+      - [-0.77, 0.74]
+      - [-2.38, -1.248]
+      - [-1.16, 0.81]
+      - [-0.64, 0.7354]
+      - [-1.26, 1.5382]
+      - [0, 100]
+      - [0.0, 0.9374]
+      - [0.0, 2.5847]
+      - [0.0, 2.3262]
+      - [-1.5906, 1.5906]
+      - [-0.1645, 0.1645]
+      - [-1.5208, 1.5208]
+      - [-0.2143, 0.4936]
+
+# 相机已切到数采 para：SDK 直接出 640x480（4:3），与训练 origin 一致。
+# 不再裁工作模式 16:9 腕部；只把 640x480 等比例 letterbox 到 224x224（上下各约 28 px）。
+image_preprocess:
+  enabled: true
+  training_size: [480, 640]
+  target_size: [224, 224]
+  expected_native_size: [480, 640]
+  crop_to_training_aspect: false
+
+vla:
+  # behavior_tree 通过本机端口连接对应 PolicyServer；按实际隧道修改。
+  policy_server_address: "127.0.0.1:30018"
+  connect_timeout: 10.0
+  action_response_timeout: 30.0
+  policy_type: "pi05"
+  pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0914/pick_place_balence/checkpoints/040000/pretrained_model"
+  device: "cuda"
+  actions_per_chunk: 25
+  setup_policy: true
+  instruction: "Left arm pick up A. Right arm pick up A."
+  observation_features:
+    observation.images.head_right:
+      dtype: image
+      shape: [224, 224, 3]
+      names: [height, width, channels]
+    observation.images.left_arm:
+      dtype: image
+      shape: [224, 224, 3]
+      names: [height, width, channels]
+    observation.images.right_arm:
+      dtype: image
+      shape: [224, 224, 3]
+      names: [height, width, channels]
+    observation.state:
+      dtype: float32
+      shape: [23]
+      names:
+        - right_arm_joint1
+        - right_arm_joint2
+        - right_arm_joint3
+        - right_arm_joint4
+        - right_arm_joint5
+        - right_arm_joint6
+        - right_arm_joint7
+        - right_arm_gripper
+        - left_arm_joint1
+        - left_arm_joint2
+        - left_arm_joint3
+        - left_arm_joint4
+        - left_arm_joint5
+        - left_arm_joint6
+        - left_arm_joint7
+        - left_arm_gripper
+        - leg_joint1
+        - leg_joint2
+        - leg_joint3
+        - leg_joint4
+        - leg_joint5
+        - head_joint1
+        - head_joint2
+
+output:
+  directory: outputs
+  result_file: predictions.jsonl

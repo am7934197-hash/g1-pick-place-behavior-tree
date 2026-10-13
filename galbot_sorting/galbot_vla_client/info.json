@@ -1,0 +1,56 @@
+{
+  "robot": {
+    "type": "galbot_g1",
+    "sensor_set": [
+      "HEAD_RIGHT_CAMERA",
+      "LEFT_ARM_CAMERA",
+      "RIGHT_ARM_CAMERA",
+      "BASE_LIDAR",
+      "TORSO_IMU"
+    ],
+    "joint_groups": ["right_arm", "right_gripper"],
+    "left_arm_joint_names": [
+      "left_arm_joint_1",
+      "left_arm_joint_2",
+      "left_arm_joint_3",
+      "left_arm_joint_4",
+      "left_arm_joint_5",
+      "left_arm_joint_6",
+      "left_arm_joint_7"
+    ],
+    "right_arm_joint_names": [
+      "right_arm_joint_1",
+      "right_arm_joint_2",
+      "right_arm_joint_3",
+      "right_arm_joint_4",
+      "right_arm_joint_5",
+      "right_arm_joint_6",
+      "right_arm_joint_7"
+    ],
+    "gripper_joint_names": ["right_gripper"],
+    "state_dim": 8,
+    "state_description": "right_arm(7) + right_gripper(1) = 8",
+    "vla_controlled_joints": {
+      "right_arm": 7,
+      "right_gripper": 1
+    },
+    "vla_action_dim": 8,
+    "camera": {
+      "head": {
+        "name": "head_right_camera",
+        "type": "rgb",
+        "resolution": [720, 1280, 3]
+      },
+      "left": {
+        "name": "left_arm_camera",
+        "type": "rgb",
+        "resolution": [360, 640, 3]
+      },
+      "right": {
+        "name": "right_arm_camera",
+        "type": "rgb",
+        "resolution": [360, 640, 3]
+      }
+    }
+  }
+}

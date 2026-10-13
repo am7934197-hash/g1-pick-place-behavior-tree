@@ -1,0 +1,127 @@
+robot:
+  sensor_set:
+    - HEAD_RIGHT_CAMERA
+    - LEFT_ARM_CAMERA
+    - RIGHT_ARM_CAMERA
+    - BASE_LIDAR
+    - TORSO_IMU
+  # 传感器预热时间（SDK 示例建议 5s，head 相机较慢需要 10s）
+  sensor_warmup_seconds: 10.0
+  # RGB 相机取图重试
+  camera_rgb_retries: 3
+  camera_rgb_retry_delay: 0.2
+  reference_frame: "base_link"
+  end_effector_frame: "right_arm"
+  gripper_group: "right_gripper"
+  # 夹爪运动参数：原默认 velocity=0.05，这里提高到 0.15
+  gripper_velocity: 0.15
+  gripper_effort: 10.0
+  gripper_min_width: 0.0
+  gripper_max_width: 0.12
+  # 普通接口按米配置夹爪宽度，set_joint_commands 夹爪位置范围为 0~0.12
+  gripper_width_command_scale: 1.0
+  vla_joint_groups:
+    - "right_arm"
+    - "right_gripper"
+  vla_action_dim: 8
+  state_feature_names:
+    - "right_arm_joint1"
+    - "right_arm_joint2"
+    - "right_arm_joint3"
+    - "right_arm_joint4"
+    - "right_arm_joint5"
+    - "right_arm_joint6"
+    - "right_arm_joint7"
+    - "right_arm_gripper"
+  # 初始手臂位姿（left 7 + right 7，不含 gripper）
+  init_arm_position:
+    - -0.4002249240875244
+    - -0.14098244905471802
+    - 0.6252642273902893
+    - -1.9931904077529907
+    - -0.4031256437301636
+    - 0.5057579874992371
+    - 1.2167335748672485
+    - -0.9656888842582703
+    - 0.8100857734680176
+    - 0.737150251865387
+    - 1.2129950523376465
+    - 0.15239167213439941
+    - 0.06517059355974197
+    - -1.538202778
+  # 初始夹爪开度 [left_gripper, right_gripper]
+  init_gripper_position:
+    - 0.00
+    - 0.1
+  # 导航目标位姿 [x, y, z, qx, qy, qz, qw]
+  navigation:
+    shelf_pose: [-1.3292715549468994, 0.029076972976326942, 0.0, 0.0, 0.0, 0.999884015291495, 0.0011186691199588838]
+    table_pose: [0.9178516268730164, -0.1555481255054474, 0.0, 0.0, 0.0, -0.005407745870204063, 0.9999853174986784]
+  placement:
+    # 固定放置关节角（left 7 + right 7）
+    fixed_placement_joints:
+      - 1.9876313
+      - -1.2883269
+      - -1.1919742
+      - -2.3345485
+      - -0.6320482
+      - 0.19774054
+      - 0.6029972
+      - -1.6153055
+      - 1.1291772
+      - 1.0402284
+      - 2.0435011
+      - 0.5150344
+      - -0.11382512
+      - -0.15507597
+    gripper_open_width: 0.08
+    gripper_close_width: 0.02
+    set_ee_timeout: 5.0
+    motion_collision_check: false
+  control:
+    fps: 30
+    dt: 0.033
+    set_joint_time_from_start: 0.0
+    # VLA 数据集/模型夹爪动作是 0~100，映射到 set_joint_commands 的 0~0.12 
+    gripper_action_scale: 0.0012
+    # 动作平滑参数
+    max_joint_delta_per_step: 0.3
+    # 夹爪动作是 VLA 0~100 单位，不能使用手臂弧度限幅
+    gripper_max_delta_per_step: 20.0
+
+vla:
+  # PolicyServer gRPC 地址（机器人端直连）
+  policy_server_address: "112.65.216.193:30014"
+  policy_type: "pi05"
+  pretrained_name_or_path: "/home/chenhaonan/projects/lerobot/outputs/train/pi05_base_galbot_sorting_0717_1_relative_full_finetune_20260721_121625/checkpoints/017500/pretrained_model"
+  device: "cuda"
+  actions_per_chunk: 50
+  # PolicyServer 返回 50 帧预测，但本地只执行前 N 帧后重新推理，避免提前执行后半段闭合夹爪动作
+  execute_actions_per_chunk: 25
+  auto_setup_policy: true
+  fps: 30
+  obs_queue_timeout: 1.0
+  instruction: "Place electrical component A and electrical component B from the left box into their designated positions in the right box. Place electrical component A in the bottom left corner of the right box, and electrical component B in the bottom right corner of the right box."
+  # observation 特征描述（与 PolicyServer 的 RemotePolicyConfig.lerobot_features 对应）
+  observation_features:
+    observation.images.head_right:
+      dtype: "image"
+      shape: [480, 640, 3]
+      names: ["height", "width", "channels"]
+    observation.images.left_arm:
+      dtype: "image"
+      shape: [480, 640, 3]
+      names: ["height", "width", "channels"]
+    observation.images.right_arm:
+      dtype: "image"
+      shape: [480, 640, 3]
+      names: ["height", "width", "channels"]
+    observation.state:
+      dtype: "float32"
+      shape: [8]
+      names: ["right_arm_joint1", "right_arm_joint2", "right_arm_joint3", "right_arm_joint4", "right_arm_joint5", "right_arm_joint6", "right_arm_joint7", "right_arm_gripper"]
+
+server:
+  host: "0.0.0.0"
+  port: 8005
+  vla_inference_log_file: "vla_inference_results.jsonl"

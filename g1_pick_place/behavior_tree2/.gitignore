@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+env/
+
+logs/
+**/logs/
+*.log
+
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# 本地产物：姿态快照、临时记录，不上传
+pick/init_position/current_pose_*.json
+pick/init_position/record_current_pose.py
