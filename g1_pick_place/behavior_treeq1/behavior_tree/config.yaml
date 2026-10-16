@@ -1,0 +1,205 @@
+# G1 pick → place 双模型行为树。infer_server.py 与 behavior_tree.py 都读这份文件。
+# 固定 schema（相机、23 维状态、letterbox 224、PNG）在 alignment_schema.py。
+
+# true：抓取前复位后只运行 A 段；跑满 point_a.max_steps 后张开双夹爪，
+#       不收臂、不导航、不运行 B 段、不复位。失败或中途停止时不张开。
+# false（默认）：运行完整抓取、移动、放置和返回流程。
+only_pick: false 
+
+infer_server:
+  url: "http://127.0.0.1:8006"
+  timeout_seconds: 3600
+
+# 启动前机器人应已在地图原点 pick。
+navigation:
+  points_file: /home/galbot/project_yuqiz/g1_move/slam/nav_points.json
+  pick: pick
+  place: place
+  timeout_seconds: 60
+  retries: 3
+
+point_a:
+  profile: "model_at_a"
+  instruction: "Left arm pick up A. Right arm pick up A."
+  max_steps: 700
+
+point_b:
+  profile: "model_at_b"
+  instruction: "Left arm places A in the top-left corner. Right arm places A in the top-left corner."
+  max_steps: 600
+# 模型 A 执行完成后、导航到 place 前的双臂位置（不包含夹爪）。
+intermediate_arm_pose:
+  right_arm: [-1.265749, 1.324881, 0.714450, 2.151433, -0.037774, 0.310105, 0.089954]
+  left_arm: [1.201492, -1.374110, -0.519996, -2.066869, 0.171086, -0.416956, -0.202533]
+  duration_seconds: 3.0
+  control_hz: 100
+  settle_seconds: 0.2
+  joint_tolerance_rad: 0.03
+  retries: 2
+
+vla_runtime:
+  mode: "single_model"
+  shared_profile: "model_at_a"
+  checkpoint_source: "remote"
+
+startup_logging:
+  verbose_preprocess: false
+
+vla_profiles:
+  model_at_a:
+    #pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/pick_place_0911_clean179/checkpoints/040000/pretrained_model"
+    #pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0914/only_pick/checkpoints/040000/pretrained_model"
+   # pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/1009/pick_place_old/checkpoints/040000/pretrained_model"
+    #pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0930/pick_place_all_sft/checkpoints/050000/pretrained_model"
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/models/g1/1012/sft_50k_right_arm_dropout20/checkpoints/050000/pretrained_model"
+    #policy_server_address: "127.0.0.1:30017"
+    policy_server_address: "112.65.216.193:30017"
+    cameras: [head_right, left_arm, right_arm]
+    image_preprocess:
+      # Pick：224 RGB -> crop 120x88 -> Lanczos4 224x164 -> 上下各补黑边 30px。
+      head_training_crop:
+        enabled: true
+    # Pick：按训练集同阶段相邻帧 AΔ/SΔ P99.9 的保守圆整值限幅。
+    # 单位为 rad / 30 Hz step，顺序均为 joint1 → joint7。
+    max_joint_delta_per_step:
+      default: 0.05
+      right_arm: [0.07, 0.035, 0.075, 0.065, 0.07, 0.095, 0.115]
+      left_arm: [0.035, 0.03, 0.045, 0.06, 0.08, 0.085, 0.12]
+    rtc:
+      enabled: true
+      execution_horizon: 10
+      max_guidance_weight: 10
+      prefix_attention_schedule: "EXP"
+      pre_infer_threshold: 32
+      # pre_infer_threshold 先触发 RTC；等待新结果时最多再执行该数量的旧 action，
+      # 达到上限后 hold 最后目标。0 表示等待期间不限制旧 action 的继续执行。
+      max_steps_per_observation: 5
+      underflow_wait_seconds: 100
+      warmup_inferences: 1
+      warmup_once_per_model: true
+
+  model_at_b:
+    pretrained_name_or_path: "/home/zhangyuqi/zhangyuqi/G1-20260911/g1/0930/pick_place_all_sft/checkpoints/040000/pretrained_model"
+    policy_server_address: "112.65.216.193:30016"
+    # B 模型训练时同样只有三路，不发送 head_left。
+    cameras: [head_right, left_arm, right_arm]
+    image_preprocess:
+      head_training_crop:
+        enabled: false
+    # Place：独立于 Pick 的逐关节单帧限幅。
+    max_joint_delta_per_step:
+      default: 0.05
+      right_arm: [0.03, 0.02, 0.04, 0.04, 0.055, 0.065, 0.05]
+      left_arm: [0.03, 0.03, 0.04, 0.04, 0.065, 0.07, 0.055]
+    rtc:
+      enabled: true
+      execution_horizon: 10
+      max_guidance_weight: 10
+      prefix_attention_schedule: "EXP"
+      pre_infer_threshold: 40
+      max_steps_per_observation: 0
+      underflow_wait_seconds: 10
+      warmup_inferences: 1
+      warmup_once_per_model: true
+
+# ---- 推理 ----
+inference_optimization:
+  torch_dtype: "bfloat16"
+  torch_compile: true
+  use_cuda_graph: false
+
+execute_actions_per_chunk: 5
+obs_queue_timeout: 1.0
+action_response_timeout: 30.0
+
+inference_log:
+  enabled: true
+  log_dir: "logs"
+  max_log_size_mb: 100
+  log_data: true
+  save_images: true
+  image_dir: "logs/images"
+  max_image_runs: 5
+
+robot:
+  # 当前共享模型训练时只使用这三路；不初始化、不采集 head_left。
+  sensor_set: [HEAD_RIGHT_CAMERA, LEFT_ARM_CAMERA, RIGHT_ARM_CAMERA]
+  observation_camera_map:
+    head_right: head_right
+    left_arm: left_arm
+    right_arm: right_arm
+
+  init_joint_positions:
+    right_arm: [-1.159629, 0.772144, 0.729240, 1.341262, 0.379709, 0.363794, -1.538246]
+    right_gripper: [0.0]
+    left_arm: [0.852966, -0.758289, -0.192827, -1.301510, -0.466533, -0.381015, 1.381575]
+    left_gripper: [0.0]
+    leg: [0.580408, 1.433325, 0.901849, 0.000096, 0.0]
+    head: [-0.060640, 0.330046] 
+    # right_arm: [-1.148423, 0.602304, 0.744699, 1.483263, 0.355501, -0.218664, -1.418644]
+    # right_gripper: [0.0]
+    # left_arm: [0.761190, -0.624880, -0.110855, -1.601858, -0.269837, 0.051077, 1.184783]
+    # left_gripper: [0.0]
+    # leg: [0.576957, 1.461440, 0.926045, 0.040099, 0.000959]
+    # head: [-0.074961, 0.429958]
+  # 初始姿态命令发出后轮询关节反馈，到位立即返回；timeout 仅是最大等待时间。
+  init_pose_verify:
+    # 左夹爪开度未到位仅警告，继续运行；其他组仍需通过检查。
+    warning_only_groups: [left_gripper]
+
+  init_pose_restore:
+    timeout_seconds: 8.0
+    poll_interval_seconds: 0.1
+    stable_samples: 2
+    retry_delay_seconds: 0.2
+    retries: 2
+
+  control:
+    interpolation:
+      enabled: true
+      method: "linear"
+      input_hz: 30
+      output_hz: 250
+    action_filter:
+      enabled: false
+      type: "lowpass"
+      lowpass:
+        alpha: 0.3
+      moving_average:
+        window_size: 5
+      one_euro:
+        freq: 30.0
+        min_cutoff: 1.0
+        beta: 0.01
+        d_cutoff: 1.0
+    # profile 未配置 max_joint_delta_per_step 时使用这套兼容回退值。
+    # 正常 Pick/Place 执行会由 activate_profile 切换到各 profile 的配置。
+    max_joint_delta_per_step:
+      default: 0.05
+      right_arm: [0.06, 0.03, 0.06, 0.06, 0.06, 0.08, 0.10]
+      left_arm: [0.03, 0.03, 0.04, 0.05, 0.07, 0.07, 0.10]
+    gripper_max_delta_per_step: 15.0
+    # joint_limits:
+    #   - [-1.83, 0.11]       # right_arm_joint1
+    #   - [0.29, 1.6081]      # right_arm_joint2
+    #   - [-0.84, 1.17]       # right_arm_joint3
+    #   - [1.178, 2.47]       # right_arm_joint4
+    #   - [-0.76, 1.04]       # right_arm_joint5
+    #   - [-0.7354, 0.8227]   # right_arm_joint6
+    #   - [-1.5382, 0.61]     # right_arm_joint7
+    #   - [0, 100]             # right_arm_gripper
+    #   - [0.0, 1.45]         # left_arm_joint1
+    #   - [-1.6081, -0.27]    # left_arm_joint2
+    #   - [-0.77, 0.74]       # left_arm_joint3
+    #   - [-2.38, -1.248]     # left_arm_joint4
+    #   - [-1.16, 0.81]       # left_arm_joint5
+    #   - [-0.64, 0.7354]     # left_arm_joint6
+    #   - [-1.26, 1.5382]     # left_arm_joint7
+    #   - [0, 100]             # left_arm_gripper
+    #   - [0.0, 0.9374]       # leg_joint1
+    #   - [0.0, 2.5847]       # leg_joint2
+    #   - [0.0, 2.3262]       # leg_joint3
+    #   - [-1.5906, 1.5906]   # leg_joint4
+    #   - [-0.1645, 0.1645]   # leg_joint5
+    #   - [-1.5208, 1.5208]   # head_joint1
+    #   - [-0.2143, 0.4936]   # head_joint2
